@@ -6,7 +6,7 @@ The user requested this build and explicitly authorized a new signing identity f
 
 ## Verified
 
-- Local accounting, synchronization, media, numeric parsing and Room 16→17 migration regression tests pass. Final test count and APK verification are recorded below after the final build.
+- Local accounting, synchronization, media, numeric parsing and Room 16→17 migration regression tests pass. Final test count and APK verification are recorded below.
 - Android lint passes with no errors; existing warnings remain.
 - Edge-function source mock tests pass, including authentication and deletion isolation.
 - Production SQL rollback-only regression checks pass for financial insert/edit/retry/delete, cheque state transitions, bank/ledger projection and deletion tombstones.
@@ -27,4 +27,14 @@ See [the Persian release report](RELEASE_7.0.1_FA.md) and [Supabase setup](SUPAB
 
 ## Final artifact
 
-Final signed build and verification pending.
+Signed release build completed successfully. The delivered APK is `DentalPro-7.0.1-release.apk` (35,438,828 bytes).
+
+- Unit tests: **87 passed, 0 failures, 0 errors, 0 skipped**.
+- Android lint: **0 errors**, 205 warnings.
+- APK signature verified and matched the new private signing key.
+- Package/version checked: `com.dentalpro.clinic`, `7.0.1` / `70001`; not debuggable.
+- ZIP alignment and all five ARM64 native libraries passed 16 KB alignment checks.
+- APK SHA-256: `4c7449ef7e4d02b408555525454d8a96838942653754ecaed8ed8c8a76708f96`.
+- Signing certificate SHA-256: `a733266c0c7cf78db6ea99286e103385e52a76ebab3858fb91824a259988ce84`.
+
+GitHub automation is in [PR #1](https://github.com/samanta-nz/Dental_Pro/pull/1). It runs CI and publishes a signed release automatically when a version change reaches `main`. Signing secrets must be registered through repository Settings because the connected tool cannot manage Secrets. See [GitHub release instructions](GITHUB_RELEASE_FA.md). The private key and private Secrets bundle are excluded from Git.
