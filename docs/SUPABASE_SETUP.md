@@ -66,4 +66,4 @@ python scripts/publish-release.py path/to/app-release.apk --code 70002 --name 7.
 
 The script uploads first and publishes `version_code`, `version_name`, `apk_url`, `apk_sha256`, `apk_size_bytes`, changelog and optional mandatory status afterward. Alternatively use the dashboard with the same fields. Merely uploading a file does not announce it.
 
-The current release's APK must be built and verified before any announcement. The first installation with the newly requested signing key is manual; future releases signed with that key can use the in-app installer.
+The verified 7.0.1 APK is now published on [GitHub Releases](https://github.com/samanta-nz/Dental_Pro/releases/tag/v7.0.1). Its direct URL, SHA-256 `cc07b1b75ee4e6c7e8afda23a74534d32327dd67b22419b9b6796acaed83bf97` and size `35438828` are registered in `app_updates` as active and non-mandatory; anonymous-role reading was verified. The first installation with the newly requested signing key is manual; future releases signed with that key can use the in-app installer.
