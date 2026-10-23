@@ -36,12 +36,6 @@ android {
     }
 
     signingConfigs {
-        create("debugConfig") {
-            storeFile = file("${rootDir}/debug.keystore")
-            storePassword = "android"
-            keyAlias = "androiddebugkey"
-            keyPassword = "android"
-        }
         if (keystorePropsFile.exists() && keystoreProps.getProperty("storeFile") != null) {
             create("releaseExternal") {
                 storeFile = rootProject.file(keystoreProps.getProperty("storeFile"))
@@ -55,7 +49,6 @@ android {
     buildTypes {
         debug {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("debugConfig")
         }
         release {
             isMinifyEnabled = true
