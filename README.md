@@ -1,50 +1,45 @@
-# DentalPro Android
+# DentalPro Android — 7.0.1
 
-> **Release status: NO-GO.** This codebase is undergoing correctness, privacy, security, backup, and architecture remediation. It is not approved for production or clinical use. See [release status](docs/RELEASE_STATUS.md).
+Google-only sign-in, an encrypted Room database, and owner-isolated Supabase sync for clinic records and media.
 
-## Backend
+This is an engineering release candidate. Device-level Google OAuth, Android installation, clinical workflows and physical backup restoration still require acceptance testing; see [release status](docs/RELEASE_STATUS.md) and [7.0.1 changes](docs/RELEASE_7.0.1_FA.md).
 
-The app is backed by **Supabase** (Postgres + GoTrue auth + Storage + Edge Functions).
-Server-side setup (one-time) is documented in **[docs/SUPABASE_SETUP.md](docs/SUPABASE_SETUP.md)** —
-it boils down to running [`supabase/migrations/0001_dentalpro_init.sql`](supabase/migrations/0001_dentalpro_init.sql)
-in the SQL editor, configuring auth providers, and deploying the Edge Functions in
-[`supabase/functions/`](supabase/functions/) (`send-otp`, `verify-otp`, `phone-to-email`, `extract-cheque-data`).
+## Build
 
-Architecture: Room (SQLCipher-encrypted) is the local source of truth; a
-`PendingSyncOp` queue pushes/pulls to PostgREST row-by-row with `sync_id` as the
-cross-device identity. Every row carries `owner_id` and RLS restricts access to the
-owning account. Files live in the `patient_media` / `clinic_assets` storage buckets
-under `{uid}/{uuid}.jpg` paths.
+JDK 17, Android SDK 36 and Build Tools are required. The official Gradle 9.3.1 wrapper and its distribution checksum are checked in.
 
-The Supabase **anon key** is public-by-design and lives in
-`app/src/main/java/com/example/util/Supabase.kt`. The **service_role key must never
-enter the app or this repository** — it only exists as an Edge Function secret.
-
-## Development build
-
-Prerequisites:
-
-- JDK 17
-- Android SDK (API 36 / Build Tools available through Android Studio)
-
-Use the checked-in, checksum-validated Gradle wrapper:
-
-```bash
+```sh
 ./gradlew testDebugUnitTest lintDebug assembleDebug
 ```
 
-Do not add API keys, Firebase configuration, signing keys, `keystore.properties`, `local.properties`, or `.env` files to Git.
+A release APK requires a private `keystore.properties`, `VERSION_CODE=70001`, `VERSION_NAME=7.0.1`, and an explicit build authorization:
 
-## Export rendering (images, PDFs, bank card)
+```sh
+./gradlew assembleRelease -PRELEASE_APPROVED=true
+```
 
-Every shareable PNG card, printable PDF and the bank-card image are produced by **one**
-renderer (`app/src/main/java/com/example/reports/UnifiedImageGenerator.kt`) with per-output
-canvas widths from `ExportDocKind` and a single font registry (`AppFonts`) implementing a
-three-layer type system: Vazirmatn (body/emphasis), Estedad Bold (titles), JetBrains Mono
-(figures) — all OFL‑1.1, TTFs in `app/src/main/assets/fonts/`, licenses in `LICENSES/`. See
-[docs/EXPORT_RENDERING.md](docs/EXPORT_RENDERING.md)
-and [docs/FONTS.md](docs/FONTS.md) for the rules that keep exports consistent.
+Signing material, local configuration, credentials and generated deliverables are ignored by Git. The new 7.0.1 signing key was explicitly requested for a fresh installation. Preserve that key securely: subsequent in-app updates must use the same signing identity.
 
-## Release guard
+## Authentication and backend
 
-Release variants are minified and require explicit, externally supplied signing/version configuration plus `RELEASE_APPROVED=true`. Debug signing is never used as a release fallback. The blocking criteria are in [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md).
+The app supports Google OAuth with PKCE. Tokens and the verifier use Android Keystore-backed encrypted storage. A configured local PIN still protects device access. The previous email/SMS login screens are removed; legacy OTP and phone-lookup Edge Functions return `GOOGLE_SIGN_IN_REQUIRED`.
+
+Use the same Google account to restore existing clinic data. Database setup and publishing are documented in [SUPABASE_SETUP.md](docs/SUPABASE_SETUP.md). The Supabase publishable key is public by design; service-role credentials must never enter the app or Git.
+
+Clinical buckets are private. Existing object paths are preserved. Uploads use `{owner}/{category}/{sha256}.{ext}`; an operation is acknowledged only after its referenced files upload successfully. Shared content-addressed objects are retained when an individual record is removed.
+
+## Accounting and sync
+
+Amounts are integer tomans. Pending and bounced cheques do not settle receivables. Confirmed clearing moves cash; cheque endorsement settles the patient/recipient account without depositing cash into a bank. A clinic draw reduces the linked clinic bank balance. Bank balances derive from an opening baseline plus source movements; the server serializes updates and derives its ledger from stable source IDs.
+
+Failed deliveries remain in the durable outbox. Pulls preserve pending local edits. Deletion tombstones handle empty collections. Foreground/manual sync and the 15-minute background worker send and receive data. Logout retains unsent changes by refusing destructive cleanup until delivery succeeds.
+
+## In-app updates
+
+Account → App updates provides manual checks and a Wi-Fi auto-download option. WorkManager checks every six hours. Downloads must match the published SHA-256, size, package, version code and installed signing certificate. Android asks the user to confirm installation.
+
+Publish a future signed APK with `scripts/publish-release.py` from a trusted environment, or upload it to `app_releases` and enter equivalent metadata through the Supabase dashboard. No incomplete or placeholder release is announced automatically.
+
+## Exports
+
+Cards and printable reports share `UnifiedImageGenerator`, `ExportDocKind` and `AppFonts`. See [export rendering](docs/EXPORT_RENDERING.md) and [fonts](docs/FONTS.md).

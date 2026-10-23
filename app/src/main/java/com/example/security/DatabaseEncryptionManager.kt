@@ -34,6 +34,8 @@ object DatabaseEncryptionManager {
             return existing.toByteArray(Charsets.US_ASCII).also { processPassphrase = it.copyOf() }
         }
 
+        val existingDb = context.getDatabasePath("dental_pro_database")
+        check(!existingDb.isFile || isPlaintextSqlite(existingDb)) { "Database key is missing; restore a portable backup" }
         val generated = ByteArray(32).also(SecureRandom()::nextBytes)
         val encoded = Base64.encodeToString(generated, Base64.NO_WRAP)
         generated.fill(0)
@@ -42,7 +44,7 @@ object DatabaseEncryptionManager {
     }
 
     fun currentProcessPassphrase(): ByteArray {
-        return processPassphrase?.copyOf() ?: ByteArray(32).also { processPassphrase = it.copyOf() }
+        return checkNotNull(processPassphrase) { "Database key is not initialized" }.copyOf()
     }
 
     /** Converts an existing plaintext Room database to SQLCipher before Room opens it. */
@@ -59,22 +61,10 @@ object DatabaseEncryptionManager {
                 rollback.renameTo(database)
             }
             if (database.isFile && !isPlaintextSqlite(database)) {
-                try {
-                    verify(database, passphrase)
-                    rollback.delete()
-                    staged.delete()
-                    return
-                } catch (e: Throwable) {
-                    Log.e(TAG, "Encrypted database failed verification, archiving corrupted DB: ${e.message}", e)
-                    // If decryption fails (e.g. key lost after clear data), back up corrupt db and allow fresh init
-                    val corruptBackup = File(database.parentFile, "$databaseName.corrupted-${System.currentTimeMillis()}")
-                    database.renameTo(corruptBackup)
-                    File(database.path + "-wal").delete()
-                    File(database.path + "-shm").delete()
-                    rollback.delete()
-                    staged.delete()
-                    return
-                }
+                verify(database, passphrase)
+                rollback.delete()
+                staged.delete()
+                return
             }
             if (!database.isFile) {
                 rollback.delete()
@@ -115,6 +105,7 @@ object DatabaseEncryptionManager {
             if (rollback.isFile && !database.isFile) {
                 rollback.renameTo(database)
             }
+            throw IllegalStateException("Database preparation failed; original files were preserved", error)
         } finally {
             staged.delete()
         }
@@ -291,6 +282,8 @@ object DatabaseEncryptionManager {
             sourceDatabase.query("SELECT sqlcipher_export('exported')").use { cursor ->
                 check(cursor.moveToFirst()) { "SQLCipher export did not complete" }
             }
+            val version = sourceDatabase.query("PRAGMA user_version").use { cursor -> if (cursor.moveToFirst()) cursor.getInt(0) else 0 }
+            sourceDatabase.rawExecSQL("PRAGMA exported.user_version = $version")
             sourceDatabase.rawExecSQL("DETACH DATABASE exported")
             attached = false
         } finally {

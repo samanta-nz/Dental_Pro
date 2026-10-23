@@ -1,509 +1,157 @@
 package com.example.util
 
-import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageInfo
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
-import android.util.Log
 import androidx.core.content.FileProvider
 import androidx.core.content.pm.PackageInfoCompat
+import com.google.gson.JsonObject
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import okhttp3.Cookie
-import okhttp3.CookieJar
-import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
-import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
+import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
-import kotlin.math.ceil
 
-/**
- * مدیر بروزرسانی درون‌برنامه‌ای — نسخه 7.0.0 (نوع ۱ اجباری):
- * ۱) چک نسخه از جدول app_updates سرور (Supabase)
- * ۲) پشتیبانی دانلود مستقیم از گوگل‌درایو بدون باز کردن مرورگر
- * ۳) نمایش پیشرفت با حجم کل / دانلود شده / درصد / سرعت
- * ۴) پس از دانلود: بستن اپ و باز کردن نصب‌کننده
- */
+/** Downloads only release metadata from Supabase. Android always confirms package installation. */
 object AppUpdateManager {
-
     enum class UpdateType { MAJOR, MINOR, PATCH }
-
     data class AppUpdateInfo(
-        val versionCode: Long,
-        val versionName: String,
-        val apkUrl: String,
-        val changelog: String,
-        val isMandatory: Boolean,
-        val updateType: UpdateType
+        val versionCode: Long, val versionName: String, val apkUrl: String,
+        val changelog: String, val isMandatory: Boolean, val updateType: UpdateType,
+        val sha256: String = "", val sizeBytes: Long = 0
     )
-
-    /** جزئیات پیشرفت دانلود برای نمایش در UI */
-    data class DownloadProgress(
-        val totalBytes: Long,              // -1 اگر نامشخص
-        val downloadedBytes: Long,
-        val percent: Float,                // 0..1 (اگر total نامشخص، بر اساس حدس یا 0)
-        val speedBytesPerSecond: Long      // سرعت لحظه‌ای
-    )
+    data class DownloadProgress(val totalBytes: Long, val downloadedBytes: Long, val percent: Float, val speedBytesPerSecond: Long)
+    private val downloadMutex = Mutex()
+    private const val MAX_APK_BYTES = 512L * 1024 * 1024
 
     fun parseSemver(name: String): Triple<Int, Int, Int>? {
-        val cleaned = name.trim().removePrefix("v").removePrefix("V")
-            .substringBefore("-").substringBefore("+")
-        val parts = cleaned.split(".")
-        if (parts.isEmpty()) return null
-        val major = parts.getOrNull(0)?.filter { it.isDigit() }?.toIntOrNull() ?: return null
-        val minor = parts.getOrNull(1)?.filter { it.isDigit() }?.toIntOrNull() ?: 0
-        val patch = parts.getOrNull(2)?.filter { it.isDigit() }?.toIntOrNull() ?: 0
-        return Triple(major, minor, patch)
+        val match = Regex("^[vV]?(\\d+)\\.(\\d+)\\.(\\d+)(?:[-+].*)?$").matchEntire(name.trim()) ?: return null
+        val parts = match.groupValues.drop(1).map { it.toIntOrNull() ?: return null }
+        return Triple(parts[0], parts[1], parts[2])
     }
-
     fun classifyUpdate(currentName: String, remoteName: String): UpdateType {
         val cur = parseSemver(currentName) ?: return UpdateType.MINOR
         val rem = parseSemver(remoteName) ?: return UpdateType.MINOR
-        return when {
-            rem.first > cur.first -> UpdateType.MAJOR
-            rem.second > cur.second -> UpdateType.MINOR
-            else -> UpdateType.PATCH
-        }
+        return when { rem.first > cur.first -> UpdateType.MAJOR; rem.first == cur.first && rem.second > cur.second -> UpdateType.MINOR; else -> UpdateType.PATCH }
     }
+    fun currentVersionCode(context: Context): Long = PackageInfoCompat.getLongVersionCode(context.packageManager.getPackageInfo(context.packageName, 0))
+    fun currentVersionName(context: Context): String = context.packageManager.getPackageInfo(context.packageName, 0).versionName.orEmpty()
 
-    fun currentVersionCode(context: Context): Long = try {
-        val pi = context.packageManager.getPackageInfo(context.packageName, 0)
-        PackageInfoCompat.getLongVersionCode(pi)
-    } catch (e: Exception) {
-        Long.MAX_VALUE
+    fun parseUpdate(row: JsonObject, currentCode: Long, currentName: String): AppUpdateInfo? {
+        fun text(key: String) = row.get(key)?.takeIf { !it.isJsonNull }?.asString.orEmpty()
+        val code = row.get("version_code")?.asLong ?: return null
+        if (code <= currentCode) return null
+        val url = text("apk_url").toHttpUrlOrNull()
+        require(url?.isHttps == true && url.username.isBlank() && url.password.isBlank()) { "لینک امن دانلود نسخه تنظیم نشده است" }
+        val hash = text("apk_sha256").lowercase()
+        require(Regex("[a-f0-9]{64}").matches(hash)) { "اطلاعات صحت فایل نسخه جدید کامل نیست" }
+        val size = row.get("apk_size_bytes")?.takeIf { !it.isJsonNull }?.asLong ?: 0L
+        require(size in 1..MAX_APK_BYTES) { "حجم معتبر نسخه جدید مشخص نشده است" }
+        val type = classifyUpdate(currentName, text("version_name"))
+        return AppUpdateInfo(code, text("version_name"), url.toString(), text("changelog"),
+            row.get("is_mandatory")?.asBoolean == true || currentCode < (row.get("min_supported_version_code")?.asLong ?: 0L), type, hash, size)
     }
-
-    fun currentVersionName(context: Context): String = try {
-        context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: ""
-    } catch (e: Exception) {
-        ""
-    }
-
     suspend fun checkForUpdate(context: Context): AppUpdateInfo? = withContext(Dispatchers.IO) {
-        try {
-            val row = Supabase.fetchLatestAppUpdate() ?: return@withContext null
-            val remoteCode = row.get("version_code")?.takeIf { !it.isJsonNull }?.asLong ?: return@withContext null
-            val apkUrl = row.get("apk_url")?.takeIf { !it.isJsonNull }?.asString.orEmpty()
-            if (apkUrl.isBlank()) return@withContext null
-            val current = currentVersionCode(context)
-            if (remoteCode <= current) return@withContext null
-            val minSupported = row.get("min_supported_version_code")?.takeIf { !it.isJsonNull }?.asLong ?: 0L
-            val remoteName = row.get("version_name")?.takeIf { !it.isJsonNull }?.asString.orEmpty()
-
-            val updateType = classifyUpdate(currentVersionName(context), remoteName)
-            val mandatory = updateType == UpdateType.MAJOR ||
-                (row.get("is_mandatory")?.takeIf { !it.isJsonNull }?.asBoolean ?: false) ||
-                current < minSupported
-
-            AppUpdateInfo(
-                versionCode = remoteCode,
-                versionName = remoteName,
-                apkUrl = apkUrl,
-                changelog = row.get("changelog")?.takeIf { !it.isJsonNull }?.asString.orEmpty(),
-                isMandatory = mandatory,
-                updateType = updateType
-            )
-        } catch (e: Exception) {
-            Log.w("AppUpdateManager", "Update check failed: ${e.message}")
-            null
-        }
+        Supabase.fetchLatestAppUpdate()?.let { parseUpdate(it, currentVersionCode(context), currentVersionName(context)) }
     }
 
-    // ------------------------------------------------------------------
-    // Google Drive — استخراج fileId و ساخت لینک مستقیم
-    // ------------------------------------------------------------------
-
-    /**
-     * استخراج fileId از انواع لینک گوگل‌درایو:
-     * - https://drive.google.com/file/d/FILEID/view?usp=sharing
-     * - https://drive.google.com/open?id=FILEID
-     * - https://drive.google.com/uc?id=FILEID&export=download
-     * - https://drive.google.com/uc?export=download&id=FILEID
-     * - https://drive.usercontent.google.com/download?id=FILEID&export=download...
-     */
     fun extractDriveFileId(url: String): String? {
-        val trimmed = url.trim()
-        if (!trimmed.contains("drive.google.com") && !trimmed.contains("drive.usercontent.google.com") && !trimmed.contains("docs.google.com")) {
-            return null
-        }
-        // Pattern 1: /d/FILEID/
-        Regex("""/d/([a-zA-Z0-9_-]{10,})""").find(trimmed)?.let {
-            return it.groupValues[1]
-        }
-        // Pattern 2: ?id=FILEID or &id=FILEID
-        Regex("""[?&]id=([a-zA-Z0-9_-]{10,})""").find(trimmed)?.let {
-            return it.groupValues[1]
-        }
-        // Pattern 3: fallback — last segment that looks like id
-        return null
+        val parsed = url.toHttpUrlOrNull() ?: return null
+        if (parsed.host !in setOf("drive.google.com", "drive.usercontent.google.com", "docs.google.com")) return null
+        return parsed.queryParameter("id") ?: Regex("/d/([a-zA-Z0-9_-]{10,})").find(parsed.encodedPath)?.groupValues?.get(1)
     }
+    fun isGoogleDriveUrl(url: String): Boolean = extractDriveFileId(url) != null
+    fun toDirectDriveDownloadUrl(originalUrl: String): String = extractDriveFileId(originalUrl)?.let {
+        "https://drive.usercontent.google.com/download?id=$it&export=download&confirm=t"
+    } ?: originalUrl
+    fun getEffectiveDownloadUrl(originalUrl: String): String = toDirectDriveDownloadUrl(originalUrl)
 
-    fun isGoogleDriveUrl(url: String): Boolean {
-        return url.contains("drive.google.com") || url.contains("drive.usercontent.google.com")
+    fun sha256(file: File): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        file.inputStream().use { input -> val buffer = ByteArray(128 * 1024); while (true) { val n = input.read(buffer); if (n < 0) break; digest.update(buffer, 0, n) } }
+        return digest.digest().joinToString("") { "%02x".format(it) }
     }
-
-    fun toDirectDriveDownloadUrl(originalUrl: String): String {
-        val fileId = extractDriveFileId(originalUrl) ?: return originalUrl
-        // لینک مستقیم استاندارد — برای فایل‌های کوچک همین کافی است
-        return "https://drive.google.com/uc?export=download&id=$fileId"
+    @Suppress("DEPRECATION")
+    fun validateApk(context: Context, file: File, info: AppUpdateInfo) {
+        require(file.isFile && file.length() == info.sizeBytes && sha256(file).equals(info.sha256, true)) { "فایل نسخه جدید ناقص یا نامعتبر است؛ دوباره دانلود کنید" }
+        val flags = if (Build.VERSION.SDK_INT >= 28) PackageManager.GET_SIGNING_CERTIFICATES else PackageManager.GET_SIGNATURES
+        val archive = requireNotNull(context.packageManager.getPackageArchiveInfo(file.path, flags)) { "فایل دانلودشده APK معتبر نیست" }
+        require(archive.packageName == context.packageName && PackageInfoCompat.getLongVersionCode(archive) == info.versionCode && info.versionCode > currentVersionCode(context)) { "فایل دانلودشده متعلق به نسخه جدید این برنامه نیست" }
+        fun signers(pi: PackageInfo): Set<String> = (if (Build.VERSION.SDK_INT >= 28) pi.signingInfo?.apkContentsSigners else pi.signatures)
+            .orEmpty().map { MessageDigest.getInstance("SHA-256").digest(it.toByteArray()).joinToString("") { b -> "%02x".format(b) } }.toSet()
+        val expected = signers(context.packageManager.getPackageInfo(context.packageName, flags))
+        require(expected.isNotEmpty() && signers(archive) == expected) { "امضای نسخه جدید با این برنامه مطابقت ندارد" }
+        require((archive.applicationInfo?.minSdkVersion ?: 0) <= Build.VERSION.SDK_INT) { "این نسخه با اندروید دستگاه سازگار نیست" }
     }
-
-    /**
-     * برای فایل‌های حجیم گوگل‌درایو صفحه اخطار ویروس‌اسکن نشان می‌دهد.
-     * این تابع سعی می‌کند لینک واقعی drive.usercontent.google.com را از HTML استخراج کند.
-     * اگر موفق نشود، همان لینک مستقیم اولیه را برمی‌گرداند.
-     */
-    private fun resolveDriveConfirmUrlSync(client: OkHttpClient, directUrl: String): String {
+    suspend fun downloadApk(context: Context, info: AppUpdateInfo, onProgress: (DownloadProgress) -> Unit): File = withContext(Dispatchers.IO) { downloadMutex.withLock {
+        val dir = File(context.filesDir, "updates").apply { check(isDirectory || mkdirs()) }
+        val destination = File(dir, "dentalpro-${info.versionCode}.apk")
+        if (destination.isFile && runCatching { validateApk(context, destination, info) }.isSuccess) return@withLock destination
+        val temporary = File.createTempFile("download-", ".part", dir)
         try {
-            val fileId = extractDriveFileId(directUrl) ?: return directUrl
-            val request = Request.Builder()
-                .url(directUrl)
-                .header("User-Agent", "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36")
-                .get()
-                .build()
+            val client = Supabase.http.newBuilder().readTimeout(120, TimeUnit.SECONDS).followSslRedirects(false).build()
+            val request = Request.Builder().url(getEffectiveDownloadUrl(info.apkUrl)).build()
             client.newCall(request).execute().use { response ->
-                // اگر ریدایرکت به drive.usercontent باشد
-                val location = response.header("Location")
-                if (!location.isNullOrBlank() && location.contains("drive.usercontent.google.com")) {
-                    Log.d("AppUpdateManager", "Drive redirect Location: $location")
-                    return location
-                }
-                // اگر خود response ریدایرکت شده (OkHttp followRedirects=true) و URL نهایی usercontent باشد
-                val finalUrl = response.request.url.toString()
-                if (finalUrl.contains("drive.usercontent.google.com/download")) {
-                    Log.d("AppUpdateManager", "Drive final URL is direct: $finalUrl")
-                    return finalUrl
-                }
-                val body = response.body?.string() ?: return directUrl
-                // اگر content-type باینری باشد (یعنی مستقیم دانلود شده)، همان directUrl کافی است
-                if (!body.trimStart().startsWith("<", ignoreCase = true) && body.length > 1000) {
-                    // به احتمال زیاد باینری نیست چون string کردیم، ولی اگر HTML نباشد
-                    // یعنی مستقیم نیست — با این حال ما نمی‌توانیم تشخیص دهیم، پس ادامه به پارس HTML
-                }
-                // جستجوی لینک drive.usercontent در HTML
-                // نمونه: https://drive.usercontent.google.com/download?id=FILEID&export=download&confirm=XXX&uuid=YYY
-                val patterns = listOf(
-                    Regex("""https://drive\.usercontent\.google\.com/download\?[^"'\s<>]+"""),
-                    Regex("""https://drive\.google\.com/uc\?export=download[^"'\s<>]+confirm[^"'\s<>]+"""),
-                    Regex("""href="([^"]*export=download[^"]*confirm[^"]*)""""),
-                    Regex("""export=download&amp;confirm=([^&]+)&amp;id=([^&"]+)"""),
-                    Regex(""""downloadUrl":"([^"]+)"""")
-                )
-                for (regex in patterns) {
-                    val match = regex.find(body)
-                    if (match != null) {
-                        var url = match.groupValues.getOrNull(1) ?: match.value
-                        url = url.replace("&amp;", "&")
-                            .replace("\\u003d", "=")
-                            .replace("\\u0026", "&")
-                            .replace("\\/", "/")
-                        if (url.startsWith("/")) {
-                            url = "https://drive.google.com$url"
-                        }
-                        if (url.contains("drive.usercontent.google.com") || url.contains("export=download")) {
-                            Log.d("AppUpdateManager", "Drive resolved confirm URL: $url")
-                            // اطمینان از وجود id
-                            if (!url.contains("id=") && fileId.isNotBlank()) {
-                                url += if (url.contains("?")) "&id=$fileId" else "?id=$fileId"
-                            }
-                            return url
-                        }
-                    }
-                }
-                // تلاش دوم: استخراج confirm token و ساخت لینک نهایی
-                val confirmRegex = Regex("""confirm=([a-zA-Z0-9_-]+)""")
-                val uuidRegex = Regex("""uuid=([a-zA-Z0-9-]+)""")
-                val confirmMatch = confirmRegex.find(body)
-                val uuidMatch = uuidRegex.find(body)
-                if (confirmMatch != null) {
-                    val confirm = confirmMatch.groupValues[1]
-                    val uuid = uuidMatch?.groupValues?.get(1)
-                    var final = "https://drive.usercontent.google.com/download?id=$fileId&export=download&confirm=$confirm"
-                    if (uuid != null) final += "&uuid=$uuid"
-                    Log.d("AppUpdateManager", "Drive constructed confirm URL: $final")
-                    return final
-                }
-                // اگر چیزی پیدا نشد، همان direct
-                return directUrl
-            }
-        } catch (e: Exception) {
-            Log.w("AppUpdateManager", "resolveDriveConfirmUrl failed: ${e.message}")
-            return directUrl
-        }
-    }
-
-    private fun createDriveClient(): OkHttpClient {
-        // CookieJar ساده برای نگهداری NID و غیره که گوگل‌درایو نیاز دارد
-        val cookieStore = mutableMapOf<String, MutableList<Cookie>>()
-        val cookieJar = object : CookieJar {
-            override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
-                cookieStore[url.host] = (cookieStore[url.host] ?: mutableListOf()).apply {
-                    addAll(cookies)
-                }
-            }
-            override fun loadForRequest(url: HttpUrl): List<Cookie> {
-                return cookieStore[url.host] ?: emptyList()
-            }
-        }
-        return OkHttpClient.Builder()
-            .cookieJar(cookieJar)
-            .connectTimeout(30, TimeUnit.SECONDS)
-            .readTimeout(120, TimeUnit.SECONDS)
-            .writeTimeout(120, TimeUnit.SECONDS)
-            .followRedirects(true)
-            .followSslRedirects(true)
-            .build()
-    }
-
-    fun getEffectiveDownloadUrl(originalUrl: String): String {
-        if (!isGoogleDriveUrl(originalUrl)) return originalUrl
-        val direct = toDirectDriveDownloadUrl(originalUrl)
-        // تلاش برای رفع confirm token به صورت sync (در downloadApk دوباره با همین کلاینت انجام می‌شود)
-        return direct
-    }
-
-    // ------------------------------------------------------------------
-    // دانلود APK با گزارش پیشرفت کامل
-    // ------------------------------------------------------------------
-
-    /**
-     * دانلود فایل APK نسخه جدید در cache/updates/ با گزارش پیشرفت کامل.
-     * از لینک گوگل‌درایو هم پشتیبانی می‌کند (بدون باز کردن مرورگر).
-     */
-    suspend fun downloadApk(
-        context: Context,
-        info: AppUpdateInfo,
-        onProgress: (DownloadProgress) -> Unit
-    ): File = withContext(Dispatchers.IO) {
-        val dir = File(context.cacheDir, "updates").apply { mkdirs() }
-        dir.listFiles()?.forEach { it.delete() }
-        val outFile = File(dir, "dentalpro_update_v${info.versionCode}.apk")
-
-        val originalUrl = info.apkUrl.trim()
-        val isDrive = isGoogleDriveUrl(originalUrl)
-        val client: OkHttpClient
-        val effectiveUrl: String
-
-        if (isDrive) {
-            client = createDriveClient()
-            val direct = toDirectDriveDownloadUrl(originalUrl)
-            effectiveUrl = resolveDriveConfirmUrlSync(client, direct)
-            Log.d("AppUpdateManager", "Drive effective URL: $effectiveUrl")
-        } else {
-            client = Supabase.http.newBuilder()
-                .connectTimeout(30, TimeUnit.SECONDS)
-                .readTimeout(120, TimeUnit.SECONDS)
-                .build()
-            effectiveUrl = originalUrl
-        }
-
-        val request = Request.Builder()
-            .url(effectiveUrl)
-            .header("User-Agent", "Mozilla/5.0 (Linux; Android 12) DentalPro Updater")
-            .get()
-            .build()
-
-        client.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) {
-                throw IllegalStateException("دانلود ناموفق (HTTP ${response.code}) - لینک را بررسی کنید (دسترسی 'Anyone with link' برای گوگل‌درایو لازم است)")
-            }
-            val body = response.body ?: throw IllegalStateException("پاسخ خالی از سرور")
-            // اگر گوگل‌درایو به جای APK صفحه HTML برگرداند، خطا بده
-            val contentType = body.contentType()?.toString() ?: ""
-            if (contentType.contains("text/html", ignoreCase = true)) {
-                // ممکن است هنوز صفحه تایید باشد — سعی کنیم طول محتوا را چک کنیم
-                val preview = try {
-                    body.source().peek().readString(1024, Charsets.UTF_8)
-                } catch (e: Exception) { "" }
-                if (preview.contains("Google Drive", ignoreCase = true) && preview.contains("Virus scan warning", ignoreCase = true) || preview.contains("export=download")) {
-                    throw IllegalStateException("لینک گوگل‌درایو نیاز به تایید دارد — لطفاً مطمئن شوید فایل با دسترسی 'Anyone with link - Viewer' به اشتراک گذاشته شده و حجم آن کمتر از محدودیت اسکن نیست، یا از لینک مستقیم drive.usercontent استفاده کنید")
-                }
-                // اگر HTML بود ولی ما انتظار APK داریم، اگر سایز کوچک باشد خطا
-                val contentLen = body.contentLength()
-                if (contentLen in 0..50000) {
-                    // احتمالاً صفحه خطا
-                    throw IllegalStateException("پاسخ دریافتی فایل APK نیست (نوع: $contentType) — لینک دانلود را بررسی کنید")
-                }
-            }
-
-            val total = body.contentLength() // ممکن است -1 باشد اگر سرور chunked بدهد
-            var downloaded = 0L
-            val startNs = System.nanoTime()
-            var lastNs = startNs
-            var lastBytes = 0L
-            var lastSpeed = 0L
-
-            body.byteStream().use { input ->
-                outFile.outputStream().use { output ->
-                    val buffer = ByteArray(128 * 1024) // 128KB buffer برای سرعت بهتر
+                check(response.isSuccessful && response.request.url.isHttps) { "دانلود نسخه جدید ناموفق بود (${response.code})" }
+                val body = checkNotNull(response.body) { "پاسخ دانلود خالی است" }
+                check(body.contentType()?.subtype?.contains("html", true) != true) { "لینک دانلود به صفحه وب اشاره می‌کند؛ لینک مستقیم APK لازم است" }
+                if (body.contentLength() >= 0L) check(body.contentLength() == info.sizeBytes) { "حجم فایل سرور با نسخه اعلام‌شده مطابقت ندارد" }
+                var downloaded = 0L
+                var lastReport = 0L
+                val start = System.nanoTime()
+                body.byteStream().use { input -> temporary.outputStream().use { output ->
+                    val buffer = ByteArray(128 * 1024)
                     while (true) {
-                        val read = input.read(buffer)
-                        if (read < 0) break
-                        output.write(buffer, 0, read)
-                        downloaded += read
-                        val nowNs = System.nanoTime()
-                        val elapsedTotalSec = (nowNs - startNs) / 1_000_000_000.0
-                        val intervalSec = (nowNs - lastNs) / 1_000_000_000.0
-
-                        // سرعت لحظه‌ای هر 0.4 ثانیه به‌روز شود
-                        if (intervalSec >= 0.4) {
-                            val intervalBytes = downloaded - lastBytes
-                            lastSpeed = if (intervalSec > 0) (intervalBytes / intervalSec).toLong() else 0L
-                            lastNs = nowNs
-                            lastBytes = downloaded
+                        currentCoroutineContext().ensureActive()
+                        val count = input.read(buffer)
+                        if (count < 0) break
+                        downloaded += count
+                        check(downloaded <= info.sizeBytes && downloaded <= MAX_APK_BYTES) { "حجم فایل دانلودی معتبر نیست" }
+                        output.write(buffer, 0, count)
+                        val now = System.nanoTime()
+                        if (now - lastReport >= 200_000_000L) {
+                            onProgress(DownloadProgress(info.sizeBytes, downloaded, downloaded.toFloat() / info.sizeBytes, (downloaded * 1_000_000_000.0 / (now - start).coerceAtLeast(1)).toLong()))
+                            lastReport = now
                         }
-                        val avgSpeed = if (elapsedTotalSec > 0) (downloaded / elapsedTotalSec).toLong() else 0L
-                        val speedToReport = if (lastSpeed > 0) lastSpeed else avgSpeed
-                        val percent = if (total > 0) (downloaded.toFloat() / total).coerceIn(0f, 1f) else 0f
-
-                        onProgress(
-                            DownloadProgress(
-                                totalBytes = total,
-                                downloadedBytes = downloaded,
-                                percent = percent,
-                                speedBytesPerSecond = speedToReport
-                            )
-                        )
                     }
-                }
+                } }
             }
-            // گزارش نهایی ۱۰۰٪
-            onProgress(
-                DownloadProgress(
-                    totalBytes = if (total > 0) total else downloaded,
-                    downloadedBytes = downloaded,
-                    percent = 1f,
-                    speedBytesPerSecond = 0L
-                )
-            )
-        }
-
-        if (!outFile.isFile || outFile.length() == 0L) {
-            throw IllegalStateException("فایل دانلودشده معتبر نیست")
-        }
-        // حداقل ۱ مگابایت برای APK منطقی است — اگر کمتر باشد احتمالاً HTML خطا دانلود شده
-        if (outFile.length() < 500_000L) {
-            // چک محتوای فایل: اگر با < شروع شود HTML است
-            val header = try {
-                outFile.inputStream().use { it.readBytes().take(200).toByteArray().toString(Charsets.UTF_8) }
-            } catch (e: Exception) { "" }
-            if (header.trimStart().startsWith("<")) {
-                outFile.delete()
-                throw IllegalStateException("فایل دریافتی APK نیست (محتوای HTML) — لینک گوگل‌درایو را با دسترسی عمومی بررسی کنید")
-            }
-        }
-
-        outFile
-    }
-
-    /**
-     * نسخه سازگار با API قدیمی (Float 0..1) — برای جاهایی که هنوز callback قدیمی دارند
-     */
+            validateApk(context, temporary, info)
+            check(temporary.renameTo(destination)) { "ذخیره فایل نسخه جدید ناموفق بود" }
+            onProgress(DownloadProgress(info.sizeBytes, info.sizeBytes, 1f, 0L))
+            dir.listFiles()?.filter { it != destination && it.extension == "apk" }?.forEach { it.delete() }
+            destination
+        } finally { temporary.delete() }
+    } }
     @JvmName("downloadApkFloat")
-    suspend fun downloadApk(
-        context: Context,
-        info: AppUpdateInfo,
-        onProgressFloat: (Float) -> Unit
-    ): File {
-        return downloadApk(context, info) { prog: DownloadProgress ->
-            onProgressFloat(prog.percent)
-        }
-    }
-
-    fun canInstallPackages(context: Context): Boolean =
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            context.packageManager.canRequestPackageInstalls()
-        } else true
-
+    suspend fun downloadApk(context: Context, info: AppUpdateInfo, onProgressFloat: (Float) -> Unit): File = downloadApk(context, info) { p: DownloadProgress -> onProgressFloat(p.percent) }
+    fun canInstallPackages(context: Context): Boolean = context.packageManager.canRequestPackageInstalls()
     fun openInstallPermissionSettings(context: Context) {
-        try {
-            val intent = Intent(
-                Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
-                Uri.parse("package:${context.packageName}")
-            ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            context.startActivity(intent)
-        } catch (e: Exception) {
-            Log.w("AppUpdateManager", "Cannot open install permission settings: ${e.message}")
-        }
+        context.startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${context.packageName}")).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
     }
-
-    /**
-     * باز کردن نصب‌کننده اندروید و بستن اپ فعلی (طبق درخواست: «سپس اپ بسته و نصب بشه»)
-     */
     fun installApk(context: Context, apkFile: File) {
-        try {
-            val uri = FileProvider.getUriForFile(
-                context,
-                "${context.packageName}.fileprovider",
-                apkFile
-            )
-            val intent = Intent(Intent.ACTION_VIEW).apply {
-                setDataAndType(uri, "application/vnd.android.package-archive")
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            }
-            context.startActivity(intent)
-            // تلاش برای بستن اپ فعلی پس از باز کردن نصب‌کننده
-            // (فعالیت فعلی finish می‌شود تا کاربر مستقیم به نصب‌کننده برود)
-            if (context is Activity) {
-                context.finish()
-                // برای اطمینان، تسک را هم در اندروید ۵+ می‌بندیم؟ نه، فقط finish کافی است
-            } else {
-                // اگر context اکتیویتی نیست، سعی می‌کنیم با یک تاخیر کوتاه پروسه را ببندیم
-                // تا نصب‌کننده فرصت باز شدن داشته باشد
-                try {
-                    // هیچ kill اجباری نمی‌کنیم — فقط لاگ
-                    Log.d("AppUpdateManager", "Install intent launched, app should go background")
-                } catch (e: Exception) {
-                    Log.w("AppUpdateManager", "Could not close app: ${e.message}")
-                }
-            }
-        } catch (e: Exception) {
-            Log.e("AppUpdateManager", "installApk failed: ${e.message}", e)
-            throw e
-        }
+        check(canInstallPackages(context)) { "اجازه نصب بروزرسانی را فعال کنید" }
+        val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", apkFile)
+        context.startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri, "application/vnd.android.package-archive")
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION))
     }
-
-    // ------------------------------------------------------------------
-    // Helper های فرمت برای UI
-    // ------------------------------------------------------------------
-    fun formatBytes(bytes: Long): String {
-        if (bytes <= 0) return "۰ بایت"
-        val kb = 1024L
-        val mb = kb * 1024L
-        val gb = mb * 1024L
-        return when {
-            bytes >= gb -> String.format("%.2f GB", bytes.toDouble() / gb)
-            bytes >= mb -> String.format("%.1f MB", bytes.toDouble() / mb)
-            bytes >= kb -> String.format("%.0f KB", bytes.toDouble() / kb)
-            else -> "$bytes B"
-        }
+    fun formatBytes(bytes: Long): String = formatBytesFa(bytes, true)
+    fun formatBytesFa(bytes: Long, isPersian: Boolean): String = when {
+        bytes <= 0 -> if (isPersian) "نامشخص" else "Unknown"
+        bytes >= 1_048_576 -> "%.1f MB".format(bytes / 1_048_576.0)
+        bytes >= 1024 -> "%.0f KB".format(bytes / 1024.0)
+        else -> "$bytes B"
     }
-
-    fun formatBytesFa(bytes: Long, isPersian: Boolean): String {
-        if (bytes <= 0) return if (isPersian) "نامشخص" else "Unknown"
-        val kb = 1024L
-        val mb = kb * 1024L
-        val gb = mb * 1024L
-        return when {
-            bytes >= gb -> String.format("%.2f GB", bytes.toDouble() / gb)
-            bytes >= mb -> String.format("%.1f MB", bytes.toDouble() / mb)
-            bytes >= kb -> String.format("%.0f KB", bytes.toDouble() / kb)
-            else -> "$bytes B"
-        }
-    }
-
-    fun formatSpeed(bps: Long, isPersian: Boolean): String {
-        if (bps <= 0) return if (isPersian) "—" else "—"
-        val kb = 1024L
-        val mb = kb * 1024L
-        return when {
-            bps >= mb -> String.format("%.1f MB/s", bps.toDouble() / mb)
-            bps >= kb -> String.format("%.0f KB/s", bps.toDouble() / kb)
-            else -> "$bps B/s"
-        }
-    }
+    fun formatSpeed(bps: Long, isPersian: Boolean): String = if (bps <= 0) "—" else formatBytesFa(bps, isPersian) + "/s"
 }

@@ -27,7 +27,7 @@
         android:textSize="12sp"
         android:gravity="end" />
 
-    <View
+    <TextView
         android:layout_width="match_parent"
         android:layout_height="1dp"
         android:layout_marginTop="6dp"

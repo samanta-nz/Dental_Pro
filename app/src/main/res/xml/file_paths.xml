@@ -5,4 +5,5 @@
     <cache-path name="shared_files" path="shared/" />
     <!-- فایل APK بروزرسانی دانلودشده از سرور (برای نصب‌کننده اندروید) -->
     <cache-path name="app_updates" path="updates/" />
+    <files-path name="verified_updates" path="updates/" />
 </paths>

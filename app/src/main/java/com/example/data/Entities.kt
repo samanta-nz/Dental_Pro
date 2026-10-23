@@ -88,7 +88,7 @@ data class Treatment(
 
 /** هزینه خالص درمان؛ تخفیف بیش از هزینه هرگز منفی نمی‌شود. */
 val Treatment.netCost: Long
-    get() = (cost - discount).coerceAtLeast(0L)
+    get() = Math.subtractExact(cost.coerceAtLeast(0L), discount.coerceAtLeast(0L)).coerceAtLeast(0L)
 
 @Entity(
     tableName = "payments",
@@ -126,6 +126,11 @@ data class Payment(
     val transferTransactionId: Long? = null,      // PersonalTransaction ساخته‌شده در انتقال به حساب شخصی/اشخاص
     val transferChildrenExpenseId: Long? = null,  // ChildrenExpense ساخته‌شده در انتقال به «حساب اشخاص»
     val transferPartyPaymentId: Long? = null,     // ExpensePayment ساخته‌شده در انتقال چک به «طرف حساب» (طرف‌حساب هزینه‌های مطب)
+    val transferExpensePaymentSyncId: String = "",
+    val transferExpenseSyncId: String = "",
+    val transferTransactionSyncId: String = "",
+    val transferChildrenExpenseSyncId: String = "",
+    val transferPartyPaymentSyncId: String = "",
     // ——— تأییدهای یک‌بارمصرف ———
     // پس از فعال‌شدن دیگر غیرفعال نمی‌شوند (درخواست: «یک تیک یکبار فعال»).
     val bankReceiptConfirmed: Boolean = false,    // دریافت بانکی تأیید شد (برای چکِ پاس‌شده)
@@ -143,14 +148,9 @@ data class Payment(
  * حذف‌نشده، برگشت‌نخورده، و اگر چک است باید وصول/واگذار شده باشد (نه در جریان).
  */
 val Payment.isEffectivelyPaid: Boolean
-    get() = !isDeleted &&
-        chequeStatus != "BOUNCED" &&
-        // A received cheque settles the patient's invoice immediately; only a
-        // later BOUNCED status reverses it. Clearing controls bank balance, not
-        // the patient's receivable.
-        (type != "CHEQUE" || chequeStatus != "BOUNCED")
+    get() = !isDeleted && (type != "CHEQUE" || chequeStatus in setOf("CLEARED", "TRANSFERRED"))
 
-fun List<Payment>.postedTotal(): Long = sumOf { if (it.isEffectivelyPaid) it.amount else 0L }
+fun List<Payment>.postedTotal(): Long = fold(0L) { total, p -> Math.addExact(total, if (p.isEffectivelyPaid) p.amount else 0L) }
 
 fun List<Payment>.postedTotalFor(patientId: Long): Long =
     filter { it.patientId == patientId }.postedTotal()
@@ -318,7 +318,7 @@ data class ExpensePayment(
  * (هم‌اهنگ با [Payment] که چک برگشتی را از محاسباتِ موجودی حذف می‌کند).
  */
 fun ExpensePayment.countsAsPartyPayment(): Boolean =
-    !(method == "CHEQUE" && chequeStatus == "BOUNCED")
+    !isDeleted && (method != "CHEQUE" || chequeStatus in setOf("CLEARED", "TRANSFERRED"))
 
 /**
  * بخش‌های اصلیِ هابِ «هزینه‌های مطب» در مدل طرف‌حساب (طرف‌حساب چندطرف‌حسابی).
@@ -452,7 +452,7 @@ fun partySectionLedger(
  */
 data class PartyLedger(val orders: Long, val paid: Long) {
     /** مانده علامت‌دار: مثبت = ما به طرف‌حساب بدهکاریم، منفی = او به ما بدهکار است. */
-    val remaining: Long get() = orders - paid
+    val remaining: Long get() = Math.subtractExact(orders, paid)
 
     /** پرداختی بیش از فاکتورها انجام شده؛ طرف‌حساب به ما بدهکار است. */
     val isPartyDebtor: Boolean get() = remaining < 0
@@ -461,7 +461,7 @@ data class PartyLedger(val orders: Long, val paid: Long) {
     val debtAmount: Long get() = remaining.coerceAtLeast(0L)
 
     /** مبلغی که طرف‌حساب به ما بدهکار است (مازادِ پرداختیِ ما). */
-    val partyDebtAmount: Long get() = (-remaining).coerceAtLeast(0L)
+    val partyDebtAmount: Long get() = if (remaining < 0) Math.negateExact(remaining) else 0L
 
     /** حساب دقیقاً تسویه است. */
     val isSettled: Boolean get() = remaining == 0L
@@ -547,7 +547,7 @@ enum class ExpenseGroup(val key: String, val faTitle: String, val enTitle: Strin
 
 fun ClinicExpense.belongsToVendor(vendor: Vendor): Boolean {
     if (isDeleted) return false
-    if (vendorId != null && vendorId == vendor.id) return true
+    if (vendorId != null) return vendorId == vendor.id
     val n = vendor.name.trim()
     if (n.isBlank()) return false
     return subAccountName.trim().equals(n, ignoreCase = true)
@@ -561,7 +561,7 @@ fun vendorLedger(
     val related = expenses.filter { it.belongsToVendor(vendor) }
     if (related.isEmpty()) return PartyLedger(vendor.totalOrders, vendor.totalPaid)
     val ids = related.map { it.id }.toSet()
-    val paid = payments.filter { !it.isDeleted && it.clinicExpenseId in ids }.sumOf { it.amount }
+    val paid = payments.filter { !it.isDeleted && it.countsAsPartyPayment() && it.clinicExpenseId in ids }.sumOf { it.amount }
     return PartyLedger(orders = related.sumOf { it.amount }, paid = paid)
 }
 
@@ -580,7 +580,7 @@ fun unmatchedLabLedgers(
         .groupBy { it.subAccountName.ifBlank { it.description }.ifBlank { "لابراتوار" } }
         .map { (name, list) ->
             val ids = list.map { it.id }.toSet()
-            val paid = payments.filter { !it.isDeleted && it.clinicExpenseId in ids }.sumOf { it.amount }
+            val paid = payments.filter { !it.isDeleted && it.countsAsPartyPayment() && it.clinicExpenseId in ids }.sumOf { it.amount }
             name to PartyLedger(list.sumOf { it.amount }, paid)
         }
 }
@@ -701,6 +701,7 @@ data class BankAccount(
     val cardNumber: String = "", // e.g. "6037-xxxx-xxxx-xxxx"
     val accountNumber: String = "",
     val balance: Long = 0L,
+    val openingBalance: Long? = null, // Stable baseline; balance is opening + posted cash movements.
     val smsKeywords: String = "", // Comma-separated list like "واریز,بانک ملی"
     val cvv2: String = "",
     val expireMonth: String = "",
@@ -972,7 +973,8 @@ data class VendorInvoice(
 data class FinancialLedgerEntry(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
     val sourceType: String,
-    val sourceId: Long,
+    val sourceId: Long, // Device-local lookup only.
+    val sourceSyncId: String = "", // Stable cross-device source identity.
     val patientId: Long? = null,
     val patientSyncId: String = "",
     val bankAccountId: Long? = null,

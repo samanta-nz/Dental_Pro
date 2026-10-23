@@ -48,6 +48,11 @@ fun AccountScreen(
     val settings by viewModel.settings.collectAsStateWithLifecycle()
     val pendingOpsCount by viewModel.pendingSyncOpsCount.collectAsStateWithLifecycle()
 
+    val logoutError by viewModel.logoutError.collectAsStateWithLifecycle()
+    if (logoutError != null) {
+        AlertDialog(onDismissRequest = { viewModel.logoutError.value = null }, title = { Text("خروج انجام نشد") },
+            text = { Text(logoutError.orEmpty()) }, confirmButton = { TextButton(onClick = { viewModel.logoutError.value = null }) { Text("باشه") } })
+    }
     val cs = MaterialTheme.colorScheme
     val scope = rememberCoroutineScope()
 
@@ -137,6 +142,8 @@ fun AccountScreen(
             val avatarCameraLauncher = rememberEditableCameraLauncher(LocalContext.current) { uri ->
                 avatarEditLauncher(uri)
             }
+
+            AppUpdatesSection(viewModel, isPersian)
 
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -987,8 +994,7 @@ fun AccountScreen(
                 Button(
                     onClick = {
                         showLogoutDialog = false
-                        viewModel.logout()
-                        onLogout()
+                        viewModel.logout(onDone = onLogout)
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = cs.error)
                 ) {

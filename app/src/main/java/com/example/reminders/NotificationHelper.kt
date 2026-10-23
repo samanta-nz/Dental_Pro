@@ -69,28 +69,30 @@ fun showAppointmentReminder(context: Context, notificationId: Int, patientName: 
     if (!canPostNotifications(context)) return
     ensureNotificationChannels(context)
     val notification = NotificationCompat.Builder(context, CHANNEL_APPOINTMENTS)
+        .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
         .setSmallIcon(R.mipmap.ic_launcher)
-        .setContentTitle("یادآوری نوبت: $patientName")
+        .setContentTitle("یادآوری نوبت مطب")
         .setContentText("نوبت در $timeText")
         .setPriority(NotificationCompat.PRIORITY_DEFAULT)
         .setAutoCancel(true)
         .setContentIntent(openAppPendingIntent(context, notificationId))
         .build()
-    NotificationManagerCompat.from(context).notify(notificationId, notification)
+    postNotificationSafely(context, notificationId, notification)
 }
 
 fun showChequeDueReminder(context: Context, notificationId: Int, patientName: String, amountText: String, dueText: String) {
     if (!canPostNotifications(context)) return
     ensureNotificationChannels(context)
     val notification = NotificationCompat.Builder(context, CHANNEL_CHEQUES)
+        .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
         .setSmallIcon(R.mipmap.ic_launcher)
-        .setContentTitle("سررسید چک: $patientName")
-        .setContentText("$amountText — سررسید $dueText")
+        .setContentTitle("یادآوری سررسید چک")
+        .setContentText("برای مشاهده جزئیات وارد برنامه شوید")
         .setPriority(NotificationCompat.PRIORITY_DEFAULT)
         .setAutoCancel(true)
         .setContentIntent(openAppPendingIntent(context, notificationId))
         .build()
-    NotificationManagerCompat.from(context).notify(notificationId, notification)
+    postNotificationSafely(context, notificationId, notification)
 }
 
 /**
@@ -100,6 +102,7 @@ fun showPaymentDueReminder(context: Context, notificationId: Int, title: String,
     if (!canPostNotifications(context)) return
     ensureNotificationChannels(context)
     val notification = NotificationCompat.Builder(context, CHANNEL_CHEQUES)
+        .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
         .setSmallIcon(R.mipmap.ic_launcher)
         .setContentTitle(title)
         .setContentText(body)
@@ -107,7 +110,7 @@ fun showPaymentDueReminder(context: Context, notificationId: Int, title: String,
         .setAutoCancel(true)
         .setContentIntent(openAppPendingIntent(context, notificationId))
         .build()
-    NotificationManagerCompat.from(context).notify(notificationId, notification)
+    postNotificationSafely(context, notificationId, notification)
 }
 
 fun showOccasionReminder(context: Context, notificationId: Int, title: String, typeName: String) {
@@ -121,7 +124,7 @@ fun showOccasionReminder(context: Context, notificationId: Int, title: String, t
         .setAutoCancel(true)
         .setContentIntent(openAppPendingIntent(context, notificationId))
         .build()
-    NotificationManagerCompat.from(context).notify(notificationId, notification)
+    postNotificationSafely(context, notificationId, notification)
 }
 
 fun showBankSmsNotification(
@@ -151,17 +154,17 @@ fun showBankSmsNotification(
     val expandedBody = "🏦 بانک: $bankName\n💰 مبلغ: $amountText تومان\n📅 تاریخ: $dateStr$timePart\nلمس کنید جهت ثبت خودکار در حسابداری"
 
     val notification = NotificationCompat.Builder(context, CHANNEL_BANK_SMS)
+        .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
         .setSmallIcon(R.mipmap.ic_launcher)
-        .setContentTitle(title)
-        .setContentText("$bankName — $amountText تومان — $dateStr $timeStr")
-        .setStyle(NotificationCompat.BigTextStyle().bigText(expandedBody))
+        .setContentTitle("تراکنش بانکی جدید")
+        .setContentText("برای مشاهده و ثبت وارد برنامه شوید")
         .setPriority(NotificationCompat.PRIORITY_HIGH)
         .setDefaults(NotificationCompat.DEFAULT_ALL)
         .setAutoCancel(true)
         .setContentIntent(pendingIntent)
         .build()
 
-    NotificationManagerCompat.from(context).notify(notificationId, notification)
+    postNotificationSafely(context, notificationId, notification)
 }
 
 /**
@@ -202,6 +205,7 @@ fun showAppUpdateNotification(
     }
 
     val notification = NotificationCompat.Builder(context, CHANNEL_APP_UPDATES)
+        .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
         .setSmallIcon(R.mipmap.ic_launcher)
         .setContentTitle(title)
         .setContentText("برای دانلود و نصب لمس کنید")
@@ -212,5 +216,13 @@ fun showAppUpdateNotification(
         .setContentIntent(pendingIntent)
         .build()
 
-    NotificationManagerCompat.from(context).notify(990017, notification)
+    postNotificationSafely(context, 990017, notification)
+}
+
+private fun postNotificationSafely(context: Context, id: Int, notification: android.app.Notification) {
+    if (Build.VERSION.SDK_INT >= 33 && androidx.core.content.ContextCompat.checkSelfPermission(
+        context, android.Manifest.permission.POST_NOTIFICATIONS
+    ) != android.content.pm.PackageManager.PERMISSION_GRANTED) return
+    try { NotificationManagerCompat.from(context).notify(id, notification) }
+    catch (_: SecurityException) { /* Permission can be revoked between the check and delivery. */ }
 }

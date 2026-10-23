@@ -40,6 +40,15 @@ Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: CORS_HEADERS });
   if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
 
+  const base = Deno.env.get("SUPABASE_URL"), service = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  const authorization = req.headers.get("authorization");
+  if (!base || !service) return json({ error: "SERVER_NOT_CONFIGURED" }, 503);
+  if (!authorization?.startsWith("Bearer ")) return json({ error: "NOT_AUTHENTICATED" }, 401);
+  const identity = await fetch(`${base}/auth/v1/user`, { headers: { apikey: service, Authorization: authorization } });
+  if (!identity.ok) return json({ error: "NOT_AUTHENTICATED" }, 401);
+  const actor = await identity.json();
+  if (!actor.id || actor.role !== "authenticated") return json({ error: "NOT_AUTHENTICATED" }, 401);
+
   let imageBase64: string, prompt: string, provider: string, model: string;
   try {
     const body = await req.json();
@@ -55,6 +64,7 @@ Deno.serve(async (req: Request) => {
     return json({ error: "تصویر ارسال نشده یا نامعتبر است" }, 400);
   }
   if (!prompt) return json({ error: "پرامپت ارسال نشده است" }, 400);
+  if (imageBase64.length > 14_000_000 || prompt.length > 30_000) return json({ error: "REQUEST_TOO_LARGE" }, 413);
 
   // کلیدها فقط از Secretهای سرور خوانده می‌شوند — نه از کلاینت
   const geminiKeys = readKeys(Deno.env.get("GEMINI_API_KEY"), Deno.env.get("GEMINI_API_KEYS"));
@@ -62,13 +72,13 @@ Deno.serve(async (req: Request) => {
 
   let apiKeys: string[];
   if (provider === "gemini") {
-    apiKeys = geminiKeys.length > 0 ? geminiKeys : groqKeys; // اگر فقط گروک تنظیم شده بود
+    apiKeys = geminiKeys; // اگر فقط گروک تنظیم شده بود
     if (apiKeys.length === 0) {
       return json({ error: "کلید Gemini روی سرور تنظیم نشده است (GEMINI_API_KEY)" }, 503);
     }
     if (!model) model = "gemini-2.0-flash";
   } else if (provider === "groq") {
-    apiKeys = groqKeys.length > 0 ? groqKeys : geminiKeys;
+    apiKeys = groqKeys;
     if (apiKeys.length === 0) {
       return json({ error: "کلید Groq روی سرور تنظیم نشده است (GROQ_API_KEY)" }, 503);
     }

@@ -26,12 +26,11 @@ fun RealTimeAmountHelper(
     amountStr: String,
     isPersian: Boolean = true
 ) {
-    val clean = amountStr.replace(Regex("[^0-9]"), "")
-    val value = clean.toLongOrNull() ?: 0L
-    if (value > 0L) {
-        val toman = value / 10L
-        val formattedRial = com.example.util.PersianNumberFormatter.formatAmount(value)
-        val formattedToman = com.example.util.PersianNumberFormatter.formatAmount(toman)
+    val value = amountStr.toEnglishLongOrNull() ?: 0L
+    if (value > 0L && value <= Long.MAX_VALUE / 10L) {
+        val rial = Math.multiplyExact(value, 10L)
+        val formattedRial = com.example.util.PersianNumberFormatter.formatAmount(rial)
+        val formattedToman = com.example.util.PersianNumberFormatter.formatAmount(value)
         val inWords = try {
             com.example.util.PersianNumberFormatter.numberToPersianWords(value)
         } catch (_: Exception) { "" }
@@ -69,12 +68,15 @@ fun String.toEnglishLong(): Long = this.toEnglishLongOrNull() ?: 0L
 
 fun String.toEnglishLongOrNull(): Long? {
     if (this.isBlank()) return null
-    val clean = com.example.util.PersianNumberFormatter.toAsciiDigits(this).replace(Regex("[^0-9]"), "")
+    val clean = com.example.util.PersianNumberFormatter.toAsciiDigits(this)
+        .replace("−", "-").replace(Regex("[\\u200e\\u200f\\u202a-\\u202e\\u2066-\\u2069]"), "")
+        .replace(Regex("(?i)(تومان|ریال|toman|rial)"), "").replace(Regex("[,٬\\s]"), "")
+    if (!Regex("[+-]?[0-9]+").matches(clean)) return null
     return clean.toLongOrNull()
 }
 
 fun String.toEnglishIntOrNull(): Int? {
-    return this.toEnglishLongOrNull()?.toInt()
+    return this.toEnglishLongOrNull()?.takeIf { it in Int.MIN_VALUE.toLong()..Int.MAX_VALUE.toLong() }?.toInt()
 }
 
 fun String.cleanNotesForDisplay(): String {
@@ -90,22 +92,16 @@ fun Modifier.threeSecondLongPress(onLongClick: () -> Unit): Modifier =
 
 
 fun parseTeethCount(toothNumStr: String): Int {
-    if (toothNumStr.isBlank()) return 1
-    val tokens = toothNumStr.split(Regex("[/,\\s]+")).map { it.trim() }.filter { it.isNotEmpty() }
-    var count = 0
-    for (token in tokens) {
-        if (token.contains("-")) {
-            val parts = token.split("-").mapNotNull { it.trim().toEnglishLongOrNull()?.toInt() }
-            if (parts.size == 2 && parts[1] >= parts[0]) {
-                count += (parts[1] - parts[0] + 1)
-            } else {
-                count += 1
-            }
-        } else if (token.any { it.isDigit() || "۰۱۲۳۴۵۶۷۸۹".contains(it) }) {
-            count += 1
-        }
+    val normalized = com.example.util.PersianNumberFormatter.toAsciiDigits(toothNumStr).replace('،', ',')
+    val teeth = mutableSetOf<Int>()
+    fun valid(n: Int) = n / 10 in 1..4 && n % 10 in 1..8 || n / 10 in 5..8 && n % 10 in 1..5
+    normalized.split(Regex("[/,\\s]+")).forEach { token ->
+        val range = token.split('-').mapNotNull { it.toIntOrNull() }
+        if (range.size == 2 && range.all { it in 11..85 }) {
+            for (n in minOf(range[0], range[1])..maxOf(range[0], range[1])) if (valid(n)) teeth.add(n)
+        } else if (range.size == 1 && valid(range[0])) teeth.add(range[0])
     }
-    return if (count > 0) count else 1
+    return teeth.size.coerceAtLeast(1)
 }
 
 fun honorificPatientName(name: String, gender: String = ""): String {

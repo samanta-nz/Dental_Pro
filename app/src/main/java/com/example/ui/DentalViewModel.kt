@@ -74,7 +74,9 @@ data class CloudBackupRecord(
 class DentalViewModel(application: Application) : AndroidViewModel(application) {
     val database = AppDatabase.getDatabase(application)
     val appContext = application.applicationContext
-    private val repository = DentalRepository(database)
+    private val repository = DentalRepository(database) {
+        application.getSharedPreferences("dental_pro_prefs", Context.MODE_PRIVATE).getString("auth_account_id", null)
+    }
     var syncEngine = com.example.sync.SyncEngine(false, appContext, repository, database)
 
     /** قفل همگام‌سازی بوت‌استرپ — از اجرای همزمانِ چند pullAll در اثر رویدادهای گوناگون لاگین
@@ -89,14 +91,9 @@ class DentalViewModel(application: Application) : AndroidViewModel(application) 
     val pendingSyncOpsCount: StateFlow<Int> = repository.pendingSyncOpsCount.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0)
 
     // ------------------------------------------------------------------
-    // بروزرسانی درون‌برنامه‌ای از طریق سرور (جدول app_updates در Supabase)
-    // نوع بروزرسانی از ارقام نسخه تشخیص داده می‌شود:
-    //   MAJOR (رقم اول، 6→7): اجباری — دیالوگ غیرقابل‌رد
-    //   MINOR (رقم وسط، 3→4): اختیاری — اعلان و دیالوگ در هر بار اجرا + تایید کاربر
-    //   PATCH (رقم آخر، 1→2): بهبود/رفع باگ — فقط اعلان متنی خود-حذف در استارت،
-    //                          حداکثر روزی یک‌بار
-    // ------------------------------------------------------------------
-    /** نسخهٔ جدید MAJOR/MINOR اعلام‌شده از سرور (null = چیزی برای دیالوگ نیست) */
+    // Updates are checked at startup, manually, and by WorkManager.
+    // Mandatory installation is an explicit server policy, independent of semver classification.
+    /** Latest verified release metadata. */
     val availableAppUpdate = MutableStateFlow<com.example.util.AppUpdateManager.AppUpdateInfo?>(null)
 
     /** نسخهٔ جدید PATCH — فقط بنر متنی خود-حذف‌شونده در استارت اپ (روزی یک‌بار) */
@@ -109,50 +106,25 @@ class DentalViewModel(application: Application) : AndroidViewModel(application) 
     /**
      * چک بروزرسانی از سرور و اعمال سیاست اعلان بر اساس نوع نسخه.
      */
+    val isCheckingAppUpdate = MutableStateFlow(false)
+    val appUpdateStatus = MutableStateFlow<String?>(null)
     fun checkForAppUpdate(notify: Boolean = true) {
+        if (isCheckingAppUpdate.value) return
+        isCheckingAppUpdate.value = true
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val info = com.example.util.AppUpdateManager.checkForUpdate(appContext) ?: return@launch
-                when (info.updateType) {
-                    com.example.util.AppUpdateManager.UpdateType.MAJOR -> {
-                        // اجباری: دیالوگ غیرقابل‌رد + اعلان سیستمی در هر بار اجرا
-                        availableAppUpdate.value = info
-                        if (notify) {
-                            com.example.reminders.showAppUpdateNotification(
-                                appContext, info.versionName, info.changelog, mandatory = true
-                            )
-                        }
-                    }
-                    com.example.util.AppUpdateManager.UpdateType.MINOR -> {
-                        // اختیاری: اعلان «هر بار» اجرا + دیالوگ با تایید/رد توسط کاربر
-                        availableAppUpdate.value = info
-                        if (notify) {
-                            com.example.reminders.showAppUpdateNotification(
-                                appContext, info.versionName, info.changelog, mandatory = false
-                            )
-                        }
-                    }
-                    com.example.util.AppUpdateManager.UpdateType.PATCH -> {
-                        // بهبود/رفع باگ: بدون اعلان سیستمی و بدون دیالوگ —
-                        // فقط بنر متنی خود-حذف در استارت اپ، حداکثر روزی یک‌بار
-                        val gateKey = "patch_notice_last_day"
-                        val today = java.text.SimpleDateFormat("yyyyMMdd", java.util.Locale.US)
-                            .format(java.util.Date())
-                        val versionKey = "patch_notice_last_version"
-                        val lastDay = prefs.getString(gateKey, "") ?: ""
-                        val lastVersion = prefs.getLong(versionKey, 0L)
-                        if (lastDay != today || lastVersion != info.versionCode) {
-                            patchUpdateNotice.value = info
-                            prefs.edit()
-                                .putString(gateKey, today)
-                                .putLong(versionKey, info.versionCode)
-                                .apply()
-                        }
-                    }
+                val info = com.example.util.AppUpdateManager.checkForUpdate(appContext)
+                if (info == null) {
+                    appUpdateStatus.value = "برنامه به‌روز است."
+                    availableAppUpdate.value = null
+                } else {
+                    appUpdateStatus.value = "نسخه ${info.versionName} آماده دریافت است."
+                    availableAppUpdate.value = info
+                    if (notify) com.example.reminders.showAppUpdateNotification(appContext, info.versionName, info.changelog, info.isMandatory)
                 }
-            } catch (e: Exception) {
-                Log.w("DentalViewModel", "checkForAppUpdate failed: ${e.message}")
-            }
+            } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+            catch (e: Exception) { appUpdateStatus.value = "بررسی نسخه انجام نشد؛ اتصال را بررسی و دوباره تلاش کنید." }
+            finally { isCheckingAppUpdate.value = false }
         }
     }
 
@@ -161,15 +133,6 @@ class DentalViewModel(application: Application) : AndroidViewModel(application) 
         viewModelScope.launch {
             kotlinx.coroutines.delay(5_000)
             checkForAppUpdate()
-        }
-        // Backfill یک‌باره و idempotent: داده‌های قدیمیِ هزینه‌ها به طرف‌حساب‌ها
-        // (party_accounts) پیوند می‌خورند تا هابِ جدید بلافاصله درست کار کند.
-        viewModelScope.launch(Dispatchers.IO) {
-            runCatching { repository.migrateLegacyExpenseParties() }
-            // اصلاح سرفصل‌های شخصی (جریمهٔ دیرکرد بانک ← هزینه‌های اداری) و ساختِ
-            // طرف‌حساب‌های پیش‌فرضِ «هزینه‌های جاری مطب» (اجاره/شارژ/قبوض) — idempotent.
-            runCatching { repository.migratePersonalHeadingFixes() }
-            runCatching { repository.ensureDefaultRunningParties() }
         }
         // کلیدهای API از سرور خوانده می‌شوند (منبع حقیقت سرور است؛ کش محلی فقط
         // برای کار در حالت آفلاین نگه داشته می‌شود).
@@ -728,12 +691,19 @@ class DentalViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun onAppForegrounded() {
+        if (bootstrapCompletedForAccount != null && com.example.util.Supabase.currentSession != null && !isGuestMode.value) {
+            viewModelScope.launch(Dispatchers.IO) {
+                try { syncEngine.pushPending(); if (database.pendingSyncOpDao().countOnce() == 0) syncEngine.pullAll() }
+                catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                catch (e: Exception) { Log.w("DentalViewModel", "Foreground sync will retry") }
+            }
+        }
         val backgroundedAt = prefs.getLong("app_backgrounded_at", 0L)
         if (backgroundedAt > 0L && System.currentTimeMillis() - backgroundedAt >= 2 * 60 * 1000L) {
             lockApp()
         }
         prefs.edit().remove("app_backgrounded_at").apply()
-        // چک‌های سررسیدشده (۲ روز پس از سررسید، برگشت‌نخورده) خودکار پاس می‌شوند.
+        // A due date is a reminder, never evidence of bank clearing.
         autoClearOverdueCheques()
     }
 
@@ -1630,22 +1600,7 @@ class DentalViewModel(application: Application) : AndroidViewModel(application) 
             }
         }
         
-        // Seed reference catalogs exactly once. Never infer a first run from an empty patient list:
-        // a clinic may legitimately have deleted all patients while retaining customized settings.
-        viewModelScope.launch {
-            seedReferenceData()
-            repository.allCalendarEvents.first().let { list ->
-                val vKey = "calendar_events_1405_pdf_v3"
-                val updated = prefs.getBoolean(vKey, false)
-                if (list.isEmpty() || !updated) {
-                    if (!updated && list.isNotEmpty()) {
-                        repository.deleteNonPersonalCalendarEvents()
-                    }
-                    seedDefaultCalendarEvents()
-                    prefs.edit().putBoolean(vKey, true).apply()
-                }
-            }
-        }
+
     }
 
     // Streams from Repository
@@ -3073,36 +3028,8 @@ class DentalViewModel(application: Application) : AndroidViewModel(application) 
             payment.chequeStatus != "CLEARED" &&
             payment.chequeStatus != "BOUNCED"
 
-    /**
-     * انتقالِ خودکارِ چک‌های سررسیدشده به «پاس‌شده».
-     *
-     * قاعده (درخواست کاربر): هر چکِ «در جریان وصول» که ۲ روز از تاریخِ سررسیدش
-     * گذشته و برگشت نخورده، خودکار به وضعیتِ CLEARED منتقل می‌شود. این تابع هنگام
-     * بازگشتِ اپ به پیش‌زمینه صدا زده می‌شود و idempotent است (چکِ غیرِ PENDING را
-     * دست نمی‌زند).
-     */
-    fun autoClearOverdueCheques() {
-        viewModelScope.launch {
-            val now = System.currentTimeMillis()
-            val twoDaysMs = 2L * 24 * 60 * 60 * 1000
-            val due = allPayments.value.filter {
-                it.type == "CHEQUE" &&
-                    !it.isDeleted &&
-                    it.chequeStatus == "PENDING" &&
-                    it.chequeDueDate != null &&
-                    now - it.chequeDueDate!! >= twoDaysMs
-            }
-            due.forEach { cheque ->
-                repository.updatePayment(
-                    cheque.copy(
-                        chequeStatus = "CLEARED",
-                        isCleared = true,
-                        updatedAt = System.currentTimeMillis()
-                    )
-                )
-            }
-        }
-    }
+    /** Compatibility hook: clearing always requires explicit confirmation. */
+    fun autoClearOverdueCheques() = Unit
 
     // Cheque Transfer Helpers
     fun transferChequeToExpense(payment: Payment, recipientName: String, category: String = "سایر", expenseId: Long? = null) {
@@ -3452,7 +3379,7 @@ class DentalViewModel(application: Application) : AndroidViewModel(application) 
             var remaining = amount
             for (exp in related) {
                 if (remaining <= 0L) break
-                val already = existingPays.filter { it.clinicExpenseId == exp.id }.sumOf { it.amount }
+                val already = existingPays.filter { it.countsAsPartyPayment() && it.clinicExpenseId == exp.id }.sumOf { it.amount }
                 val due = (exp.amount - already).coerceAtLeast(0L)
                 if (due <= 0L) continue
                 val chunk = minOf(due, remaining)
@@ -4018,10 +3945,10 @@ class DentalViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    fun updateBankAccount(account: BankAccount) {
+    fun updateBankAccount(account: BankAccount, updateBalance: Boolean = true) {
         if (!authorizeDomain("bank", "UPDATE_BANK_ACCOUNT")) return
         viewModelScope.launch {
-            repository.insertBankAccount(account)
+            repository.insertBankAccount(account, updateBalance = updateBalance)
         }
     }
 
@@ -4036,7 +3963,7 @@ class DentalViewModel(application: Application) : AndroidViewModel(application) 
     fun toggleBankAccountHidden(account: BankAccount) {
         if (!authorizeDomain("bank", "UPDATE_BANK_ACCOUNT")) return
         viewModelScope.launch {
-            repository.insertBankAccount(account.copy(isHidden = !account.isHidden, updatedAt = System.currentTimeMillis()))
+            repository.insertBankAccount(account.copy(isHidden = !account.isHidden, updatedAt = System.currentTimeMillis()), updateBalance = false)
         }
     }
 
@@ -4059,14 +3986,14 @@ class DentalViewModel(application: Application) : AndroidViewModel(application) 
             if (target < 0 || target >= normalized.size) {
                 // فقط نرمال‌سازی را ذخیره کن (اگر لازم بود) بدون جابه‌جایی
                 normalized.forEachIndexed { i, acc ->
-                    if (ordered[i].sortOrder != acc.sortOrder) repository.insertBankAccount(acc)
+                    if (ordered[i].sortOrder != acc.sortOrder) repository.insertBankAccount(acc, updateBalance = false)
                 }
                 return@launch
             }
             val a = normalized[index]
             val b = normalized[target]
-            repository.insertBankAccount(a.copy(sortOrder = b.sortOrder, updatedAt = System.currentTimeMillis()))
-            repository.insertBankAccount(b.copy(sortOrder = a.sortOrder, updatedAt = System.currentTimeMillis()))
+            repository.insertBankAccount(a.copy(sortOrder = b.sortOrder, updatedAt = System.currentTimeMillis()), updateBalance = false)
+            repository.insertBankAccount(b.copy(sortOrder = a.sortOrder, updatedAt = System.currentTimeMillis()), updateBalance = false)
         }
     }
 
@@ -5349,147 +5276,7 @@ class DentalViewModel(application: Application) : AndroidViewModel(application) 
         }
 
         // صندوق‌های پیش‌فرض مطب: فقط «تنخواه گردان مطب» و «کیف پول».
-        if (repository.allBankAccounts.first().isEmpty()) {
-            database.bankAccountDao().insertBankAccount(
-                com.example.data.BankAccount(
-                    bankName = "تنخواه گردان مطب",
-                    cardHolder = "تنخواه گردان",
-                    accountNumber = "PETTY-01",
-                    balance = 0L
-                )
-            )
-            database.bankAccountDao().insertBankAccount(
-                com.example.data.BankAccount(
-                    bankName = "کیف پول",
-                    cardHolder = "کیف پول",
-                    accountNumber = "CASH-WALLET",
-                    balance = 0L
-                )
-            )
-        }
-
-        // Deduplication & cleanup of repeated personal sub-accounts (سرفصل‌های شخصی تکراری)
-        try {
-            val allSubsInDb = database.personalSubAccountDao().getAllList()
-            val seenSubKeys = mutableSetOf<String>()
-            allSubsInDb.forEach { sub ->
-                val normKey = "${sub.category.trim()}|${sub.parentName.trim()}|${sub.name.trim()}"
-                if (normKey in seenSubKeys) {
-                    database.personalSubAccountDao().deleteSubAccount(sub)
-                } else {
-                    seenSubKeys.add(normKey)
-                }
-            }
-        } catch (e: Exception) {
-            Log.e("DentalViewModel", "Deduplicating subaccounts failed: ${e.message}")
-        }
-
-        // Do not duplicate or overwrite user-maintained reference/settings rows.
-        // Seed کامل سرفصل‌های حساب شخصی از ساختار درختی پرمیس (۱۶۵ حساب —
-        // هزینه‌ها/درآمدها/دارایی‌ها/بدهی‌ها/سرمایه/بدهکاران/بستانکاران).
-        // هم برای نصب تازه و هم نصب‌های موجود اجرا می‌شود؛ فقط موارد غایب درج
-        // می‌شوند (dedup با کلید دسته|والد|نام) و از مسیر Repository تا به سرور سینک شوند.
-        if (!prefs.getBoolean("parmis_subaccounts_seeded_v1", false)) {
-            val existingSubs = repository.allSubAccounts.first()
-            val existingKeys = existingSubs
-                .map { "${it.category.trim()}|${it.parentName.trim()}|${it.name.trim()}" }
-                .toHashSet()
-            com.example.util.ParmisDefaultAccounts.ALL.forEach { acc ->
-                val key = "${acc.category.trim()}|${acc.parent.trim()}|${acc.name.trim()}"
-                if (key !in existingKeys) {
-                    repository.insertSubAccount(
-                        PersonalSubAccount(
-                            name = acc.name,
-                            category = acc.category,
-                            parentName = acc.parent,
-                            ledgerSide = acc.ledgerSide
-                        )
-                    )
-                    existingKeys.add(key)
-                }
-            }
-            prefs.edit().putBoolean("parmis_subaccounts_seeded_v1", true).apply()
-        }
-
-        // «صندوق‌ها»ی مجاز (تنخواه گردان مطب / کیف پول) به‌عنوان حساب‌های نقدی
-        if (!prefs.getBoolean("parmis_funds_seeded_v1", false)) {
-            val existingBanks = repository.allBankAccounts.first()
-            com.example.util.ParmisDefaultAccounts.CASH_FUNDS.forEach { (fundName, code) ->
-                if (existingBanks.none { it.bankName == fundName }) {
-                    repository.insertBankAccount(
-                        com.example.data.BankAccount(
-                            bankName = fundName,
-                            cardHolder = fundName,
-                            accountNumber = code,
-                            balance = 0L
-                        )
-                    )
-                }
-            }
-            prefs.edit().putBoolean("parmis_funds_seeded_v1", true).apply()
-        }
-
-        // ——— پاک‌سازی صندوق‌های حذف‌شده (فقط «تنخواه گردان مطب» و «کیف پول» بمانند) ———
-        // نصب‌های قبلی ممکن است «صندوق نقدی مطب»، «گاو صندوق» و «صندوق منزل» را
-        // داشته باشند. این‌ها حذف می‌شوند، ولی فقط اگر هیچ تراکنشی به آن‌ها وصل
-        // نباشد؛ در غیر این صورت دست نخورده می‌مانند تا سابقهٔ مالی از بین نرود.
-        if (!prefs.getBoolean("funds_cleanup_v2", false)) {
-            try {
-                val banks = repository.allBankAccounts.first()
-                val keepNames = com.example.util.ParmisDefaultAccounts.KEEP_FUND_NAMES
-                val keepCodes = com.example.util.ParmisDefaultAccounts.KEEP_FUND_CODES
-
-                // شناسهٔ هر حسابی که در هر یک از پنج جدول مالی استفاده شده
-                val usedIds = HashSet<Long>()
-                repository.allPayments.first().forEach { it.bankAccountId?.let(usedIds::add) }
-                repository.allExpensePayments.first().forEach { it.bankAccountId?.let(usedIds::add) }
-                repository.allTransactions.first().forEach { it.bankAccountId?.let(usedIds::add) }
-                repository.allFixedIncomes.first().forEach { it.bankAccountId?.let(usedIds::add) }
-                database.financialLedgerDao().getAllList()
-                    .forEach { it.bankAccountId?.let(usedIds::add) }
-
-                banks.filter { it.isCashFund }
-                    .filter { it.bankName !in keepNames && it.accountNumber !in keepCodes }
-                    .filter { it.id !in usedIds && it.balance == 0L }
-                    .forEach { stale ->
-                        repository.deleteBankAccount(stale)
-                        Log.i("DentalViewModel", "Removed unused cash fund: ${stale.bankName}")
-                    }
-
-                // اطمینان از وجود دو صندوق مجاز
-                val after = repository.allBankAccounts.first()
-                com.example.util.ParmisDefaultAccounts.CASH_FUNDS.forEach { (name, code) ->
-                    if (after.none { it.bankName == name || it.accountNumber == code }) {
-                        repository.insertBankAccount(
-                            com.example.data.BankAccount(
-                                bankName = name,
-                                cardHolder = name,
-                                accountNumber = code,
-                                balance = 0L
-                            )
-                        )
-                    }
-                }
-                prefs.edit().putBoolean("funds_cleanup_v2", true).apply()
-            } catch (e: Exception) {
-                Log.e("DentalViewModel", "Fund cleanup failed: ${e.message}")
-            }
-        }
-
-        // «بدون پیش‌فرض» (درخواست کاربر): ردیف پیش‌فرض clinic_settings دیگر اینجا ساخته
-        // نمی‌شود؛ با هر لاگینِ تازه (وقتی دیتابیس محلی هنوز خالی بود) یک ردیف پیش‌فرض
-        // با syncId جدید به سرور می‌رفت و جدول clinic_settings پر از ردیف تکراری می‌شد.
-    }
-
-    /**
-     * پیدا کردن بیماران کاندیدای معاینه و یادآوری دوره‌ای ۶ ماهه (Recall Patients)
-     */
-    fun getPatientRecallCandidates(): List<Patient> {
-        val sixMonthsAgo = System.currentTimeMillis() - (180L * 24 * 60 * 60 * 1000)
-        return patients.value.filter { p ->
-            val lastApptDate = appointments.value.filter { it.patientName == p.name }.maxOfOrNull { it.date } ?: p.createdAt
-            lastApptDate < sixMonthsAgo
-        }
+        repository.allTemplates.first().forEach { repository.enqueueSyncOp("treatment_templates", it.syncId) }
     }
     // Lazily (نه Eagerly): از استارت بی‌جهت جمع‌آوری نمی‌شود، ولی چون در چند جا
     // .value به‌صورت همگام خوانده می‌شود، از WhileSubscribed استفاده نمی‌کنیم تا
@@ -5541,11 +5328,11 @@ class DentalViewModel(application: Application) : AndroidViewModel(application) 
         // deleteNonPersonalCalendarEvents) پاک می‌شوند، سپس مجموعه‌ی مرجع دوباره درج می‌شود.
         // این تضمین می‌کند که seed مجدد همیشه دقیقاً یک نسخه از هر رویداد باقی می‌گذارد، نه
         // انباشتن نسخه‌های تکراری از هر بار اجرا.
-        repository.deleteNonPersonalCalendarEvents()
+        val owner = com.example.util.Supabase.ensureAccountId()
         val events = com.example.util.DefaultCalendarEvents.parseCsvToCalendarEvents(
             com.example.util.DefaultCalendarEvents.DEFAULT_CSV
         )
-        repository.insertCalendarEvents(events)
+        repository.insertCalendarEvents(events.map { it.copy(syncId = "$owner:${it.syncId}") })
     }
 
     fun importCalendarEventsFromCsv(csvContent: String, replace: Boolean = true): Boolean {
@@ -6007,15 +5794,13 @@ class DentalViewModel(application: Application) : AndroidViewModel(application) 
             val previousAccountId = prefs.getString("auth_account_id", "") ?: ""
 
             // اگر کاربری با حسابی متفاوت از حساب قبلی لاگین کرده باشد، پایگاه داده محلی را به صورت کامل پاکسازی می‌کنیم
-            if (resolvedAccountId != null && previousAccountId.isNotBlank() && previousAccountId != resolvedAccountId) {
-                try {
-                    repository.clearAllData()
-                    File(appContext.filesDir, "images").deleteRecursively()
-                    File(appContext.cacheDir, "camera").deleteRecursively()
-                    bootstrapCompletedForAccount = null
-                } catch (e: Exception) {
-                    e.printStackTrace()
-                }
+            check(!resolvedAccountId.isNullOrBlank()) { "Sign-in is required before syncing" }
+            if (previousAccountId.isNotBlank() && previousAccountId != resolvedAccountId) {
+                if (database.pendingSyncOpDao().countOnce() != 0) throw com.example.sync.AccountMismatchException()
+                repository.clearAllData()
+                File(appContext.filesDir, "images").deleteRecursively()
+                File(appContext.cacheDir, "camera").deleteRecursively()
+                bootstrapCompletedForAccount = null
             }
             if (resolvedAccountId != null) {
                 prefs.edit().putString("auth_account_id", resolvedAccountId).apply()
@@ -6041,9 +5826,10 @@ class DentalViewModel(application: Application) : AndroidViewModel(application) 
                 // بدون توقفِ ورود کاربر؛ دفعه‌ی بعد دوباره امتحان می‌شود
             }
 
-            if (resolvedAccountId != null) {
-                bootstrapCompletedForAccount = resolvedAccountId
-            }
+            check(syncEngine.failedCollections.value.isEmpty() && syncEngine.lastError.value.isNullOrBlank()) { "Initial sync is incomplete; retry before opening records" }
+            if (repository.allTemplates.first().isEmpty()) seedReferenceData()
+            if (repository.allCalendarEvents.first().isEmpty()) seedDefaultCalendarEvents()
+            bootstrapCompletedForAccount = resolvedAccountId
             onProgress(1f)
         }
     }
@@ -6135,32 +5921,17 @@ class DentalViewModel(application: Application) : AndroidViewModel(application) 
         if (!code.isNullOrBlank()) pendingOAuthCode.value = code
     }
 
-    fun logout() {
+    val logoutError = MutableStateFlow<String?>(null)
+    fun logout(onDone: () -> Unit = {}) {
         viewModelScope.launch(Dispatchers.IO) {
-            // Best-effort: try to let any still-pending uploads/edits finish syncing before we
-            // wipe local state, so nothing not-yet-uploaded is lost. Logout must still proceed
-            // even if this fails or times out (e.g. offline) — it is not a precondition.
-            // NOTE: syncEngine.pushPending() now drains the ENTIRE pending queue in a loop
-            // (previously it only processed a single 50-item batch and returned, silently
-            // dropping any remaining queued changes once clearAllData() ran below — a real
-            // data-loss bug for anyone with >50 pending ops at logout time, e.g. after
-            // bulk-entering several patients).
-            try {
-                syncEngine.pushPending()
-            } catch (e: Exception) {
-                Log.w("DentalViewModel", "pushPending() failed during logout, proceeding anyway: ${e.message}")
+            logoutError.value = null
+            try { syncEngine.pushPending() } catch (e: Exception) {
+                logoutError.value = "خروج انجام نشد؛ تغییرات شما هنوز ارسال نشده‌اند. اتصال را بررسی و دوباره تلاش کنید."
+                return@launch
             }
-            // اگر با وجود تلاش بالا هنوز عملیات همگام‌نشده در صف مانده باشد (مثلاً به‌خاطر
-            // قطعی شبکه در همان لحظه)، این یک هشدار مهم است: چون خط بعدی (clearAllData)
-            // برگشت‌ناپذیر است و همین داده‌ی محلی را برای همیشه پاک می‌کند. حداقل لاگ واضح
-            // ثبت می‌شود تا این حالت در گزارش/دیباگ قابل ردیابی باشد.
-            try {
-                val stillPending = repository.getPendingOps(1)
-                if (stillPending.isNotEmpty()) {
-                    Log.w("DentalViewModel", "logout(): unsynced changes still pending after pushPending() drain attempt — this local data will be lost by clearAllData().")
-                }
-            } catch (e: Exception) {
-                Log.w("DentalViewModel", "logout(): failed to check remaining pending ops: ${e.message}")
+            if (database.pendingSyncOpDao().countOnce() > 0) {
+                logoutError.value = "خروج انجام نشد؛ تغییرات همگام‌نشده روی این دستگاه باقی مانده است. ابتدا همگام‌سازی را تکمیل کنید."
+                return@launch
             }
             try {
                 com.example.util.Supabase.signOut()
@@ -6188,6 +5959,8 @@ class DentalViewModel(application: Application) : AndroidViewModel(application) 
             }
             currentUserRole.value = com.example.feature.auth.UserRole.ASSISTANT
             isAppUnlocked.value = false
+            com.example.widget.AppointmentsWidgetProvider.requestUpdate(appContext)
+            withContext(Dispatchers.Main) { onDone() }
         }
     }
 
@@ -6234,6 +6007,7 @@ class DentalViewModel(application: Application) : AndroidViewModel(application) 
     fun syncWithCloud() {
         viewModelScope.launch(Dispatchers.IO) {
             syncEngine.pushPending()
+            if (database.pendingSyncOpDao().countOnce() == 0) syncEngine.pullAll()
         }
     }
 

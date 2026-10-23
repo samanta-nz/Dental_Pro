@@ -196,11 +196,11 @@ fun MainDentalScreen(viewModel: DentalViewModel, initialBankSms: String? = null,
             viewModel.checkForAppUpdate(notify = false)
         }
     }
-    if (availableAppUpdate != null && !appUpdateDialogDismissed) {
+    if (availableAppUpdate != null) {
         AppUpdateDialog(
             info = availableAppUpdate!!,
             isPersian = isPersian,
-            onDismiss = { appUpdateDialogDismissed = true }
+            onDismiss = { viewModel.availableAppUpdate.value = null }
         )
     }
 
@@ -9154,7 +9154,7 @@ fun LabsScreen(viewModel: DentalViewModel) {
 // ==========================================
 // SAYADI BARCODE SCANNER DIALOG (CAMERA & ML KIT)
 // ==========================================
-@OptIn(ExperimentalGetImage::class)
+@androidx.annotation.OptIn(markerClass = [ExperimentalGetImage::class])
 @Composable
 fun RealSayadiBarcodeScannerDialog(
     onDismiss: () -> Unit,

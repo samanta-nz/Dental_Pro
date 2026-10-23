@@ -124,10 +124,10 @@ interface AppointmentDao {
     @Delete
     suspend fun deleteAppointment(appointment: Appointment)
 
-    @Query("DELETE FROM appointments WHERE patientId = :patientId OR patientName = :patientName")
+    @Query("DELETE FROM appointments WHERE patientId = :patientId OR ((patientId IS NULL OR patientId = 0) AND patientName = :patientName)")
     suspend fun deleteAppointmentsForPatient(patientId: Long, patientName: String)
 
-    @Query("SELECT * FROM appointments WHERE patientId = :patientId OR patientName = :patientName")
+    @Query("SELECT * FROM appointments WHERE patientId = :patientId OR ((patientId IS NULL OR patientId = 0) AND patientName = :patientName)")
     suspend fun getAppointmentsForPatientOnce(patientId: Long, patientName: String): List<Appointment>
 }
 
@@ -692,6 +692,9 @@ interface StaffMemberDao {
 
 @Dao
 interface PendingSyncOpDao {
+    @Query("SELECT * FROM pending_sync_ops WHERE id > :afterId ORDER BY id ASC LIMIT :limit")
+    suspend fun getPendingOpsAfter(afterId: Long, limit: Int = 50): List<PendingSyncOp>
+
     @Query("SELECT * FROM pending_sync_ops ORDER BY id ASC LIMIT :limit")
     suspend fun getPendingOps(limit: Int = 100): List<PendingSyncOp>
 
@@ -706,6 +709,15 @@ interface PendingSyncOpDao {
 
     @Query("DELETE FROM pending_sync_ops WHERE id = :id")
     suspend fun deleteById(id: Long)
+
+    @Query("SELECT COUNT(*) FROM pending_sync_ops")
+    suspend fun countOnce(): Int
+
+    @Query("SELECT EXISTS(SELECT 1 FROM pending_sync_ops WHERE collectionTable = :table AND recordSyncId = :syncId)")
+    suspend fun hasPending(table: String, syncId: String): Boolean
+
+    @Query("UPDATE pending_sync_ops SET attemptCount = attemptCount + 1, lastError = :error WHERE id = :id")
+    suspend fun recordFailure(id: Long, error: String)
 
     @Query("DELETE FROM pending_sync_ops")
     suspend fun clearAll()
@@ -831,7 +843,7 @@ interface UnregisteredBankSmsDao {
         PendingSyncOp::class,
         UnregisteredBankSms::class
     ],
-    version = 16, // = AppDatabase.DB_VERSION (باید هم‌مقدار بماند)
+    version = 17, // = AppDatabase.DB_VERSION (باید هم‌مقدار بماند)
     exportSchema = true
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -1049,17 +1061,37 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        private val MIGRATION_16_17 = object : androidx.room.migration.Migration(16, 17) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE bank_accounts ADD COLUMN openingBalance INTEGER")
+                db.execSQL("ALTER TABLE financial_ledger ADD COLUMN sourceSyncId TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE payments ADD COLUMN transferExpensePaymentSyncId TEXT NOT NULL DEFAULT ''")
+                db.execSQL("UPDATE payments SET transferExpensePaymentSyncId = COALESCE((SELECT syncId FROM expense_payments WHERE id = payments.transferExpensePaymentId), '')")
+                db.execSQL("ALTER TABLE payments ADD COLUMN transferExpenseSyncId TEXT NOT NULL DEFAULT ''")
+                db.execSQL("UPDATE payments SET transferExpenseSyncId = COALESCE((SELECT syncId FROM clinic_expenses WHERE id = payments.transferExpenseId), '')")
+                db.execSQL("ALTER TABLE payments ADD COLUMN transferTransactionSyncId TEXT NOT NULL DEFAULT ''")
+                db.execSQL("UPDATE payments SET transferTransactionSyncId = COALESCE((SELECT syncId FROM personal_transactions WHERE id = payments.transferTransactionId), '')")
+                db.execSQL("ALTER TABLE payments ADD COLUMN transferChildrenExpenseSyncId TEXT NOT NULL DEFAULT ''")
+                db.execSQL("UPDATE payments SET transferChildrenExpenseSyncId = COALESCE((SELECT syncId FROM children_expenses WHERE id = payments.transferChildrenExpenseId), '')")
+                db.execSQL("ALTER TABLE payments ADD COLUMN transferPartyPaymentSyncId TEXT NOT NULL DEFAULT ''")
+                db.execSQL("UPDATE payments SET transferPartyPaymentSyncId = COALESCE((SELECT syncId FROM expense_payments WHERE id = payments.transferPartyPaymentId), '')")
+                for ((kind, table) in listOf("PATIENT_PAYMENT" to "payments", "EXPENSE_PAYMENT" to "expense_payments", "PERSONAL_TRANSACTION" to "personal_transactions")) {
+                    db.execSQL("UPDATE financial_ledger SET sourceSyncId = COALESCE((SELECT syncId FROM $table WHERE id = financial_ledger.sourceId), '') WHERE sourceType = ?", arrayOf(kind))
+                }
+            }
+        }
+
         /** فهرستِ واحد و مرتبِ همهٔ مهاجرت‌ها — تنها منبعِ داده‌شده به Room. */
         val ALL_MIGRATIONS: Array<androidx.room.migration.Migration> = arrayOf(
             MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6,
             MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11,
             MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_14, MIGRATION_14_15,
-            MIGRATION_15_16
+            MIGRATION_15_16, MIGRATION_16_17
         )
 
         const val SCHEMA_VERSION = 1
         /** نسخهٔ فعلیِ طرحِ Room — باید با مقدارِ @Database(version=...) هم‌مقدار بماند. */
-        const val DB_VERSION = 16
+        const val DB_VERSION = 17
         private const val DATABASE_NAME = "dental_pro_database"
 
         @Volatile
@@ -1067,50 +1099,10 @@ abstract class AppDatabase : RoomDatabase() {
 
         fun getDatabase(context: Context): AppDatabase {
             return INSTANCE ?: synchronized(this) {
-                INSTANCE ?: try {
-                    val db = buildDatabase(context)
-                    // Room تنبل است: build() دیتابیس را باز نمی‌کند و اجرای مهاجرت‌ها
-                    // + اعتبارسنجیِ نهاییِ طرح، تازه هنگامِ اولین کوئری رخ می‌دهد. اگر
-                    // یک مسیرِ مهاجرت طرح را درست نسازد، خطای «Migration didn't properly
-                    // handle...» بیرون از این try پرتاب می‌شد و اپ کرش می‌کرد. این پروبِ
-                    // سبک، آن باز شدن را همین‌جا وادار می‌کند تا هر خطای مهاجرت/رمزگشایی
-                    // در catch پایین مهار و به مسیرِ «بایگانی + ساختِ تمیز» هدایت شود.
+                buildDatabase(context).also { db ->
                     db.openHelper.readableDatabase.query("PRAGMA user_version").use { it.moveToFirst() }
-                    db
-                } catch (e: Throwable) {
-                    android.util.Log.e("AppDatabase", "Primary database open failed, archiving and recreating cleanly", e)
-                    // خراب‌بودن یا ناسازگاریِ کلید/طرح: به‌جای حذفِ خاموشِ داده، فایلِ
-                    // فعلی را با مُهرِ زمان بایگانی می‌کنیم تا قابلِ بازیابیِ دستی بماند،
-                    // سپس یک دیتابیسِ تمیز می‌سازیم.
-                    val appContext = context.applicationContext
-                    archiveDatabaseFiles(appContext)
-                    buildDatabase(context)
-                }.also { INSTANCE = it }
-            }
-        }
-
-        /**
-         * فایل‌های دیتابیس (اصلی + WAL + SHM) را به یک پوشهٔ بایگانیِ مُهرزمان‌دار
-         * منتقل می‌کند — به‌جای `delete()`. این‌طور حتی وقتی باز شدن شکست می‌خورد،
-         * دادهٔ کاربر از بین نمی‌رود و قابلِ بازگردانی است.
-         */
-        private fun archiveDatabaseFiles(appContext: Context) {
-            try {
-                val dbFile = appContext.getDatabasePath(DATABASE_NAME)
-                val archiveDir = java.io.File(dbFile.parentFile, "$DATABASE_NAME.failed-open-archive")
-                archiveDir.mkdirs()
-                val stamp = System.currentTimeMillis()
-                listOf("", "-wal", "-shm").forEach { suffix ->
-                    val src = java.io.File(dbFile.path + suffix)
-                    if (src.isFile) {
-                        src.renameTo(java.io.File(archiveDir, dbFile.name + suffix + ".$stamp"))
-                    }
+                    INSTANCE = db
                 }
-            } catch (e: Throwable) {
-                android.util.Log.w("AppDatabase", "Could not archive failed database, deleting as last resort: ${e.message}")
-                appContext.getDatabasePath(DATABASE_NAME).delete()
-                java.io.File(appContext.getDatabasePath(DATABASE_NAME).path + "-wal").delete()
-                java.io.File(appContext.getDatabasePath(DATABASE_NAME).path + "-shm").delete()
             }
         }
 
@@ -1119,15 +1111,7 @@ abstract class AppDatabase : RoomDatabase() {
             val databasePassphrase = com.example.security.DatabaseEncryptionManager.passphrase(appContext)
             // Refuse either a schema migration or plaintext-to-SQLCipher conversion unless a
             // Keystore-protected local recovery point was created first.
-            try {
-                com.example.security.DatabaseEncryptionManager.prepareEncryptedDatabase(
-                    appContext,
-                    DATABASE_NAME,
-                    databasePassphrase
-                )
-            } catch (e: Throwable) {
-                android.util.Log.w("AppDatabase", "Pre-database hooks completed with warning: ${e.message}")
-            }
+            com.example.security.DatabaseEncryptionManager.prepareEncryptedDatabase(appContext, DATABASE_NAME, databasePassphrase)
 
             // تورِ ایمنی: قبل از اجرای هر مهاجرت، یک پشتیبانِ کاملِ قابل‌بازیابی
             // بگیر. اگر با وجودِ زنجیرهٔ کاملِ مهاجرت‌ها باز هم مسیری از قلم افتاده
@@ -1152,11 +1136,6 @@ abstract class AppDatabase : RoomDatabase() {
             )
             .openHelperFactory(sqlCipherFactory)
             .addMigrations(*ALL_MIGRATIONS)
-            // زنجیرهٔ مهاجرت‌ها اکنون کامل است (۱ تا ۱۳ بدون شکاف). این fallback فقط
-            // یک شبکهٔ آخرین‌راه‌حل برای دیتابیسِ واقعاً خراب/غیرقابل‌مهاجرت است و چون
-            // درست پیش از آن یک پشتیبانِ کامل گرفته می‌شود، دیگر منجر به از دست رفتنِ
-            // خاموشِ داده نمی‌شود.
-            .fallbackToDestructiveMigration()
             .build()
         }
     }

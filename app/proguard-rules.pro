@@ -30,3 +30,11 @@
 
 # Coroutines
 -keepclassmembers class kotlinx.coroutines.** { *; }
+
+# Room entities and session envelopes are serialized with Gson/reflection. Keep wire names
+# identical in minified releases, including the dynamic media/reference mapper.
+-keepattributes Signature,*Annotation*,InnerClasses,EnclosingMethod
+-keep class com.example.data.** { *; }
+-keep class com.example.util.Supabase$Session { *; }
+-keep class com.example.util.Supabase$UserInfo { *; }
+-keep class com.example.ui.CloudBackupRecord { *; }

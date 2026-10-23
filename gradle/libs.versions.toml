@@ -32,7 +32,7 @@ okhttp = "4.10.0"
 robolectric = "4.16.1"
 roborazzi = "1.59.0"
 # --- DentalPro: پایگاه داده رمزنگاری‌شده + ابزارهای لازم ---
-sqlcipher = "4.5.4"
+sqlcipher = "4.19.1"
 sqliteKtx = "2.4.0"
 biometric = "1.1.0"
 workRuntimeKtx = "2.9.1"
