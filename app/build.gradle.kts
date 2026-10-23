@@ -29,8 +29,8 @@ android {
         applicationId = "com.dentalpro.clinic"
         minSdk = 26
         targetSdk = 36
-        versionCode = providers.gradleProperty("VERSION_CODE").getOrElse("70000").toInt()
-        versionName = providers.gradleProperty("VERSION_NAME").getOrElse("7.0.0")
+        versionCode = providers.gradleProperty("VERSION_CODE").getOrElse("70001").toInt()
+        versionName = providers.gradleProperty("VERSION_NAME").getOrElse("7.0.1")
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }
     }
@@ -173,6 +173,7 @@ dependencies {
     testImplementation(libs.androidx.core)
     testImplementation(libs.androidx.runner)
     testImplementation(libs.androidx.compose.ui.test.junit4)
+    androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
@@ -182,13 +183,19 @@ dependencies {
 // ---------------------------------------------------------------------------
 // قفل انتشار: assembleRelease بدون RELEASE_APPROVED=true ساخته نمی‌شود.
 // ---------------------------------------------------------------------------
-tasks.matching { it.name.startsWith("assemble") && it.name.endsWith("Release") }.configureEach {
-    doFirst {
-        if (!isReleaseApproved) {
-            throw GradleException(
-                "Release build blocked: set RELEASE_APPROVED=true and provide VERSION_CODE, " +
-                    "VERSION_NAME and keystore.properties per docs/RELEASE_CHECKLIST.md"
-            )
+val validateReleaseConfiguration = tasks.register("validateReleaseConfiguration") {
+    doLast {
+        check(isReleaseApproved) { "Release build requires explicit RELEASE_APPROVED=true" }
+        check(keystorePropsFile.isFile && listOf("storeFile", "storePassword", "keyAlias", "keyPassword").all { !keystoreProps.getProperty(it).isNullOrBlank() }) {
+            "Release signing configuration is required"
         }
+        check(rootProject.file(keystoreProps.getProperty("storeFile")).isFile) { "Release keystore is missing" }
+        check(providers.gradleProperty("VERSION_CODE").orNull?.toIntOrNull()?.let { it > 0 } == true && !providers.gradleProperty("VERSION_NAME").orNull.isNullOrBlank()) { "Release version must be supplied" }
+    }
+}
+tasks.configureEach {
+    if (name != "validateReleaseConfiguration" && name.contains("Release") &&
+        (name.startsWith("pre") || name.startsWith("package") || name.startsWith("bundle") || name.startsWith("assemble") || name.startsWith("validateSigning"))) {
+        dependsOn(validateReleaseConfiguration)
     }
 }

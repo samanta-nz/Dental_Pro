@@ -21,6 +21,10 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.CancellationException
+import androidx.room.withTransaction
 import kotlinx.coroutines.withContext
 import java.io.File
 
@@ -29,7 +33,9 @@ class SyncEngine(
 
     private val context: Context,
     private val repository: DentalRepository,
-    private val database: AppDatabase
+    private val database: AppDatabase,
+    private val observeNetwork: Boolean = true,
+    private val transport: SyncTransport = SupabaseSyncTransport
 ) {
     private val _isOnline = MutableStateFlow(false)
     val isOnline: StateFlow<Boolean> = _isOnline.asStateFlow()
@@ -56,7 +62,7 @@ class SyncEngine(
         context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
 
     init {
-        registerNetworkCallback()
+        if (observeNetwork) registerNetworkCallback()
     }
 
     private fun registerNetworkCallback() {
@@ -108,22 +114,27 @@ class SyncEngine(
      * صف کاملاً خالی شود (نه فقط batchِ ۵۰تاییِ اول)، چون logout() بلافاصله بعد از
      * این clearAllData() را صدا می‌زند و هر عملیاتِ جامانده برای همیشه از بین می‌رفت.
      */
-    suspend fun pushPending() = withContext(Dispatchers.IO) {
+    suspend fun pushPending() = withContext(Dispatchers.IO) { syncMutex.withLock {
         if (isGuestMode) return@withContext
 
         if (!isOnlineNow()) return@withContext
 
+        val syncOwner = requireMatchingAccount()
+        var afterId = 0L
         var safetyBatchCounter = 0
         batchLoop@ while (true) {
             if (!isOnlineNow()) break@batchLoop
-            val pendingOps = repository.getPendingOps(50)
+            val pendingOps = database.pendingSyncOpDao().getPendingOpsAfter(afterId, 50)
             if (pendingOps.isEmpty()) break@batchLoop
 
             var processedInBatch = 0
             for (op in pendingOps) {
+            afterId = op.id
             try {
+                if (requireMatchingAccount() != syncOwner) throw AccountMismatchException()
                 if (op.operation == "DELETE") {
                     deleteRemoteDocument(op.collectionTable, op.recordSyncId)
+                    if (requireMatchingAccount() != syncOwner) throw AccountMismatchException()
                     database.pendingSyncOpDao().deleteById(op.id)
                     processedInBatch++
                     continue
@@ -139,7 +150,7 @@ class SyncEngine(
                                     val uploadedId = uploadFile(file, Supabase.BUCKET_PATIENT_MEDIA, com.example.util.StorageCategory.PATIENTS)
                                     if (uploadedId != null) {
                                         toUpload = toUpload.copy(photoFileId = uploadedId, photoLocalPath = file.absolutePath)
-                                        database.patientDao().insertPatient(toUpload)
+                                        persistUploadedMedia(op.collectionTable, record, toUpload)
                                     }
                                 }
                             }
@@ -163,7 +174,7 @@ class SyncEngine(
                                     val uploadedId = uploadFile(file, Supabase.BUCKET_PATIENT_MEDIA, com.example.util.StorageCategory.PATIENTS)
                                     if (uploadedId != null) {
                                         toUpload = toUpload.copy(fileId = uploadedId, localCachePath = file.absolutePath)
-                                        database.patientDocumentDao().insertDocument(toUpload)
+                                        persistUploadedMedia(op.collectionTable, record, toUpload)
                                     }
                                 }
                             }
@@ -181,7 +192,7 @@ class SyncEngine(
                                     val uploadedId = uploadFile(file, Supabase.BUCKET_PATIENT_MEDIA, com.example.util.StorageCategory.CHEQUES)
                                     if (uploadedId != null) {
                                         toUpload = toUpload.copy(chequePhotoFileId = uploadedId)
-                                        database.paymentDao().insertPayment(toUpload)
+                                        persistUploadedMedia(op.collectionTable, record, toUpload)
                                     }
                                 }
                             }
@@ -199,7 +210,7 @@ class SyncEngine(
                                     val uploadedId = uploadFile(file, Supabase.BUCKET_CLINIC_ASSETS, com.example.util.StorageCategory.MISC)
                                     if (uploadedId != null) {
                                         toUpload = toUpload.copy(documentFileId = uploadedId)
-                                        database.vendorInvoiceDao().insertInvoice(toUpload)
+                                        persistUploadedMedia(op.collectionTable, record, toUpload)
                                     }
                                 }
                             }
@@ -217,7 +228,7 @@ class SyncEngine(
                                     val uploadedId = uploadFile(file, Supabase.BUCKET_CLINIC_ASSETS, com.example.util.StorageCategory.MISC)
                                     if (uploadedId != null) {
                                         toUpload = toUpload.copy(invoicePhotoFileId = uploadedId)
-                                        database.clinicExpenseDao().insertExpense(toUpload)
+                                        persistUploadedMedia(op.collectionTable, record, toUpload)
                                     }
                                 }
                             }
@@ -249,7 +260,7 @@ class SyncEngine(
                                     val uploadedId = uploadFile(file, Supabase.BUCKET_CLINIC_ASSETS, com.example.util.StorageCategory.CLINIC)
                                     if (uploadedId != null) {
                                         toUpload = toUpload.copy(logoFileId = uploadedId)
-                                        database.clinicSettingsDao().insertSettings(toUpload)
+                                        persistUploadedMedia(op.collectionTable, record, toUpload)
                                     }
                                 }
                             }
@@ -262,7 +273,7 @@ class SyncEngine(
                                     val uploadedId = uploadFile(file, Supabase.BUCKET_CLINIC_ASSETS, com.example.util.StorageCategory.CLINIC)
                                     if (uploadedId != null) {
                                         toUpload = toUpload.copy(avatarFileId = uploadedId)
-                                        database.clinicSettingsDao().insertSettings(toUpload)
+                                        persistUploadedMedia(op.collectionTable, record, toUpload)
                                     }
                                 }
                             }
@@ -280,7 +291,7 @@ class SyncEngine(
                                     val uploadedId = uploadFile(file, Supabase.BUCKET_CLINIC_ASSETS, com.example.util.StorageCategory.CLINIC)
                                     if (uploadedId != null) {
                                         toUpload = toUpload.copy(photoFileId = uploadedId)
-                                        database.staffMemberDao().insertStaff(toUpload)
+                                        persistUploadedMedia(op.collectionTable, record, toUpload)
                                     }
                                 }
                             }
@@ -407,13 +418,7 @@ class SyncEngine(
                             upsertRemoteDocument(Supabase.TABLE_APP_CALENDAR_EVENTS, record.syncId, mutableData)
                         }
                     }
-                    "financial_ledger" -> {
-                        val record = database.financialLedgerDao().getBySyncId(op.recordSyncId)
-                        if (record != null) {
-                            val mutableData = com.example.util.EntityMapper.toMap(record).toMutableMap()
-                            upsertRemoteDocument(Supabase.TABLE_FINANCIAL_LEDGER, record.syncId, mutableData)
-                        }
-                    }
+                    "financial_ledger" -> Unit // Legacy outbox item; server derives this from its source.
                     "audit_events" -> {
                         val record = database.auditEventDao().getBySyncId(op.recordSyncId)
                         if (record != null) {
@@ -429,19 +434,15 @@ class SyncEngine(
                         }
                     }
                 }
+                if (requireMatchingAccount() != syncOwner) throw AccountMismatchException()
                 database.pendingSyncOpDao().deleteById(op.id)
                 processedInBatch++
             } catch (e: Exception) {
                 val errorDesc = parseSyncError(e, op.collectionTable)
                 _lastError.value = errorDesc
                 Log.e("SyncEngine", "Sync error on ${op.collectionTable}:${op.recordSyncId} -> $errorDesc", e)
-                if (op.attemptCount >= 5) {
-                    Log.e("SyncEngine", "Sync failed 5 times for ${op.collectionTable}:${op.recordSyncId}. Dropping to avoid infinite loop.")
-                    database.pendingSyncOpDao().deleteById(op.id)
-                    processedInBatch++ // حذف دائمی هم «پیشرفت» است، وگرنه حلقه گیر می‌کند
-                } else {
-                    database.pendingSyncOpDao().insert(op.copy(attemptCount = op.attemptCount + 1, lastError = errorDesc))
-                }
+                if (e is CancellationException) throw e
+                database.pendingSyncOpDao().recordFailure(op.id, errorDesc)
                 continue // Try the next item instead of aborting the whole queue
             }
             }
@@ -450,7 +451,7 @@ class SyncEngine(
             // اگر در یک batch کامل هیچ عملیاتی پیشرفت نکرد (مثلاً قطع لحظه‌ای شبکه در
             // میانه‌ی کار)، حلقه را متوقف کن تا loop بی‌نهایت رخ ندهد؛ خطا/attemptCount
             // هر op برای تلاش بعدی pushPending() حفظ شده است.
-            if (processedInBatch == 0) break@batchLoop
+            // afterId advances even when a batch fails; later records must get a chance.
             // سقف مطلق ایمنی برای صف‌های بسیار بزرگ (۲۰۰ batch × ۵۰ = تا ۱۰٬۰۰۰ عملیات
             // در یک فراخوانی) تا در حالت‌های غیرمنتظره هم اجرا برای همیشه گیر نکند.
             if (safetyBatchCounter > 200) break@batchLoop
@@ -460,8 +461,8 @@ class SyncEngine(
         if (remaining.isEmpty()) {
             _lastError.value = null
         }
-        _lastSyncedAt.value = System.currentTimeMillis()
-    }
+        if (remaining.isEmpty()) _lastSyncedAt.value = System.currentTimeMillis()
+    } }
 
     // --- Foreign-key resolution for pull ------------------------------------
     // A pulled document's raw xId (e.g. patientId) is the ORIGINAL device's
@@ -505,9 +506,10 @@ class SyncEngine(
     private suspend fun resolveClinicExpenseId(rawId: Long, syncId: String): Long =
         if (syncId.isNotBlank()) database.clinicExpenseDao().getBySyncId(syncId)?.id ?: 0L else rawId
 
-    suspend fun pullAll(onProgress: (Float) -> Unit = {}) = withContext(Dispatchers.IO) {
+    suspend fun pullAll(onProgress: (Float) -> Unit = {}) = withContext(Dispatchers.IO) { syncMutex.withLock {
         if (isGuestMode) return@withContext
         if (!isOnlineNow()) return@withContext
+        requireMatchingAccount()
 
         skippedRowsByCollection.clear()
         _lastError.value = null
@@ -560,14 +562,15 @@ class SyncEngine(
                 Supabase.TABLE_PRESCRIPTIONS,
                 Supabase.TABLE_PATIENT_DOCUMENTS,
                 Supabase.TABLE_INSTALLMENTS,
-                Supabase.TABLE_PAYMENTS,
                 Supabase.TABLE_EXPENSE_PAYMENTS,
                 Supabase.TABLE_PERSONAL_TRANSACTIONS,
                 Supabase.TABLE_CHILDREN_EXPENSES,
                 Supabase.TABLE_AUDIT_EVENTS,
-                Supabase.TABLE_FINANCIAL_LEDGER,
                 Supabase.TABLE_UNREGISTERED_BANK_SMS
-            )
+            ),
+            // Ledger sources must exist locally before their device-local IDs can be resolved.
+            listOf(Supabase.TABLE_PAYMENTS),
+            listOf(Supabase.TABLE_FINANCIAL_LEDGER)
         )
 
         val collections = waves.flatten()
@@ -601,7 +604,7 @@ class SyncEngine(
                         } else {
                             val (serverSyncIds, maxRemoteUpdatedAt) = result
                             try {
-                                reconcileDeletedRecords(coll, serverSyncIds, pendingSyncIds, maxRemoteUpdatedAt)
+                                Unit // Durable tombstones, applied after all collections, determine deletions.
                             } catch (e: Exception) {
                                 Log.w("SyncEngine", "Reconcile failed for $coll: ${e.message}")
                             }
@@ -631,7 +634,7 @@ class SyncEngine(
                 } else {
                     val (serverSyncIds, maxRemoteUpdatedAt) = result
                     try {
-                        reconcileDeletedRecords(coll, serverSyncIds, pendingSyncIds, maxRemoteUpdatedAt)
+                        Unit // Durable tombstones, applied after all collections, determine deletions.
                     } catch (e: Exception) {
                         Log.w("SyncEngine", "Reconcile failed for $coll (retry pass): ${e.message}")
                     }
@@ -665,8 +668,12 @@ class SyncEngine(
             _lastError.value = if (prev.isNullOrBlank()) skipMsg else "$prev\n$skipMsg"
         }
 
-        _lastSyncedAt.value = System.currentTimeMillis()
-    }
+        if (_failedCollections.value.isEmpty() && skippedSummary.isBlank()) {
+            applyRemoteDeletions()
+            repository.reconcileBankBalances()
+            _lastSyncedAt.value = System.currentTimeMillis()
+        }
+    } }
 
     /**
      * pullCollectionPages را با تلاش مجدد (retry + backoff نمایی ساده) اجرا می‌کند تا
@@ -762,13 +769,17 @@ class SyncEngine(
         return obj
     }
 
-    private suspend fun pullDocument(
+    internal suspend fun pullDocument(
         coll: String,
         docId: String,
         json: String,
         remoteUpdatedAt: Long,
         gson: com.google.gson.Gson
-    ) {
+    ) = database.withTransaction {
+        if (database.pendingSyncOpDao().hasPending(coll, docId)) return@withTransaction
+        val expectedOwner = context.getSharedPreferences("dental_pro_prefs", Context.MODE_PRIVATE).getString("auth_account_id", "").orEmpty()
+        val rowOwner = com.google.gson.JsonParser.parseString(json).asJsonObject.get("ownerId")?.takeIf { !it.isJsonNull }?.asString.orEmpty()
+        if (expectedOwner.isNotBlank() && rowOwner.isNotBlank() && rowOwner != expectedOwner) throw AccountMismatchException()
         when (coll) {
             Supabase.TABLE_PATIENTS -> {
                 val local = database.patientDao().getBySyncId(docId)
@@ -788,7 +799,12 @@ class SyncEngine(
                 val raw = parsePulledEntity(json, com.example.data.Payment::class.java, gson, local)
                 val obj = raw.copy(
                     patientId = resolvePatientId(raw.patientId, raw.patientSyncId),
-                    bankAccountId = resolveBankAccountId(raw.bankAccountId, raw.bankAccountSyncId)
+                    bankAccountId = resolveBankAccountId(raw.bankAccountId, raw.bankAccountSyncId),
+                    transferExpensePaymentId = raw.transferExpensePaymentSyncId.takeIf { it.isNotBlank() }?.let { database.expensePaymentDao().getBySyncId(it)?.id },
+                    transferExpenseId = raw.transferExpenseSyncId.takeIf { it.isNotBlank() }?.let { database.clinicExpenseDao().getBySyncId(it)?.id },
+                    transferTransactionId = raw.transferTransactionSyncId.takeIf { it.isNotBlank() }?.let { database.personalTransactionDao().getBySyncId(it)?.id },
+                    transferChildrenExpenseId = raw.transferChildrenExpenseSyncId.takeIf { it.isNotBlank() }?.let { database.childrenExpenseDao().getBySyncId(it)?.id },
+                    transferPartyPaymentId = raw.transferPartyPaymentSyncId.takeIf { it.isNotBlank() }?.let { database.expensePaymentDao().getBySyncId(it)?.id }
                 )
                 if (local == null) database.paymentDao().insertPayment(obj)
                 else if (remoteUpdatedAt >= local.updatedAt || local.updatedAt == 0L || remoteUpdatedAt == 0L) database.paymentDao().insertPayment(obj.copy(id = local.id))
@@ -957,7 +973,15 @@ class SyncEngine(
             Supabase.TABLE_FINANCIAL_LEDGER -> {
                 val local = database.financialLedgerDao().getBySyncId(docId)
                 val raw = parsePulledEntity(json, com.example.data.FinancialLedgerEntry::class.java, gson, local)
+                if (raw.sourceSyncId.isBlank()) return@withTransaction
+                val sourceId = when (raw.sourceType) {
+                    "PATIENT_PAYMENT" -> database.paymentDao().getBySyncId(raw.sourceSyncId)?.id
+                    "EXPENSE_PAYMENT" -> database.expensePaymentDao().getBySyncId(raw.sourceSyncId)?.id
+                    "PERSONAL_TRANSACTION" -> database.personalTransactionDao().getBySyncId(raw.sourceSyncId)?.id
+                    else -> null
+                } ?: if (raw.sourceSyncId.isBlank()) raw.sourceId else error("Ledger source has not synced")
                 val obj = raw.copy(
+                    sourceId = sourceId,
                     patientId = if (!raw.patientSyncId.isNullOrBlank()) resolvePatientId(raw.patientId ?: 0L, raw.patientSyncId) else raw.patientId,
                     bankAccountId = resolveBankAccountId(raw.bankAccountId, raw.bankAccountSyncId)
                 )
@@ -1126,271 +1150,7 @@ class SyncEngine(
         }
     }
 
-        private suspend fun reconcileDeletedRecords(
-        coll: String,
-        serverSyncIds: Set<String>,
-        pendingSyncIds: Set<String>,
-        maxRemoteUpdatedAt: Long
-    ) {
-        // NB: a local record is only tombstones-deleted when ALL of these hold:
-        //   1. it has a syncId (was ever synced),
-        //   2. it is NOT present in the server snapshot for this owner,
-        //   3. it has NO pending op still queued on this device (an unsynced local
-        //      change must never be deleted), and
-        //   4. it is NOT newer than the freshest document the server returned for this
-        //      collection. Guarding on updatedAt prevents the deletion of a record whose
-        //      local copy is newer than anything the server reported (e.g. a record just
-        //      pushed on this device that hasn't propagated to the listing yet, or one
-        //      edited offline before its push). Otherwise a tombstone pass could silently
-        //      wipe a perfectly valid, up-to-date local record.
-        when (coll) {
-            Supabase.TABLE_PATIENTS -> {
-                val locals = database.patientDao().getAllList()
-                for (loc in locals) {
-                    if (loc.syncId.isNotBlank() && !serverSyncIds.contains(loc.syncId) && !pendingSyncIds.contains(loc.syncId)
-                            && loc.updatedAt <= maxRemoteUpdatedAt) {
-                        database.patientDao().deletePatient(loc)
-                    }
-                }
-            }
-            Supabase.TABLE_TREATMENTS -> {
-                val locals = database.treatmentDao().getAllList()
-                for (loc in locals) {
-                    if (loc.syncId.isNotBlank() && !serverSyncIds.contains(loc.syncId) && !pendingSyncIds.contains(loc.syncId)
-                            && loc.updatedAt <= maxRemoteUpdatedAt) {
-                        database.treatmentDao().deleteTreatment(loc)
-                    }
-                }
-            }
-            Supabase.TABLE_PAYMENTS -> {
-                val locals = database.paymentDao().getAllList()
-                for (loc in locals) {
-                    if (loc.syncId.isNotBlank() && !serverSyncIds.contains(loc.syncId) && !pendingSyncIds.contains(loc.syncId)
-                            && loc.updatedAt <= maxRemoteUpdatedAt) {
-                        database.paymentDao().deletePayment(loc)
-                    }
-                }
-            }
-            Supabase.TABLE_APPOINTMENTS -> {
-                val locals = database.appointmentDao().getAllList()
-                for (loc in locals) {
-                    if (loc.syncId.isNotBlank() && !serverSyncIds.contains(loc.syncId) && !pendingSyncIds.contains(loc.syncId)
-                            && loc.updatedAt <= maxRemoteUpdatedAt) {
-                        database.appointmentDao().deleteAppointment(loc)
-                    }
-                }
-            }
-            Supabase.TABLE_STAFF_MEMBERS -> {
-                val locals = database.staffMemberDao().getAllList()
-                for (loc in locals) {
-                    if (loc.syncId.isNotBlank() && !serverSyncIds.contains(loc.syncId) && !pendingSyncIds.contains(loc.syncId)
-                            && loc.updatedAt <= maxRemoteUpdatedAt) {
-                        database.staffMemberDao().deleteStaff(loc)
-                    }
-                }
-            }
-            Supabase.TABLE_VENDORS -> {
-                val locals = database.vendorDao().getAllList()
-                for (loc in locals) {
-                    if (loc.syncId.isNotBlank() && !serverSyncIds.contains(loc.syncId) && !pendingSyncIds.contains(loc.syncId)
-                            && loc.updatedAt <= maxRemoteUpdatedAt) {
-                        database.vendorDao().deleteVendor(loc)
-                    }
-                }
-            }
-            Supabase.TABLE_LAB_ORDERS -> {
-                val locals = database.labOrderDao().getAllList()
-                for (loc in locals) {
-                    if (loc.syncId.isNotBlank() && !serverSyncIds.contains(loc.syncId) && !pendingSyncIds.contains(loc.syncId)
-                            && loc.updatedAt <= maxRemoteUpdatedAt) {
-                        database.labOrderDao().deleteLabOrder(loc)
-                    }
-                }
-            }
-            Supabase.TABLE_EQUIPMENT_MAINTENANCES -> {
-                val locals = database.equipmentMaintenanceDao().getAllList()
-                for (loc in locals) {
-                    if (loc.syncId.isNotBlank() && !serverSyncIds.contains(loc.syncId) && !pendingSyncIds.contains(loc.syncId)
-                            && loc.updatedAt <= maxRemoteUpdatedAt) {
-                        database.equipmentMaintenanceDao().deleteMaintenance(loc)
-                    }
-                }
-            }
-            Supabase.TABLE_CLINIC_EXPENSES -> {
-                val locals = database.clinicExpenseDao().getAllList()
-                for (loc in locals) {
-                    if (loc.syncId.isNotBlank() && !serverSyncIds.contains(loc.syncId) && !pendingSyncIds.contains(loc.syncId)
-                            && loc.updatedAt <= maxRemoteUpdatedAt) {
-                        database.clinicExpenseDao().deleteExpense(loc)
-                    }
-                }
-            }
-            Supabase.TABLE_EXPENSE_PAYMENTS -> {
-                val locals = database.expensePaymentDao().getAllList()
-                for (loc in locals) {
-                    if (loc.syncId.isNotBlank() && !serverSyncIds.contains(loc.syncId) && !pendingSyncIds.contains(loc.syncId)
-                            && loc.updatedAt <= maxRemoteUpdatedAt) {
-                        database.expensePaymentDao().deleteExpensePayment(loc)
-                    }
-                }
-            }
-            Supabase.TABLE_PERSONAL_TRANSACTIONS -> {
-                val locals = database.personalTransactionDao().getAllList()
-                for (loc in locals) {
-                    if (loc.syncId.isNotBlank() && !serverSyncIds.contains(loc.syncId) && !pendingSyncIds.contains(loc.syncId)
-                            && loc.updatedAt <= maxRemoteUpdatedAt) {
-                        database.personalTransactionDao().deleteTransaction(loc)
-                    }
-                }
-            }
-            Supabase.TABLE_TREATMENT_TEMPLATES -> {
-                val locals = database.treatmentTemplateDao().getAllList()
-                for (loc in locals) {
-                    if (loc.syncId.isNotBlank() && !serverSyncIds.contains(loc.syncId) && !pendingSyncIds.contains(loc.syncId)
-                            && loc.updatedAt <= maxRemoteUpdatedAt) {
-                        database.treatmentTemplateDao().deleteTemplate(loc)
-                    }
-                }
-            }
-            Supabase.TABLE_PRESCRIPTIONS -> {
-                val locals = database.prescriptionDao().getAllList()
-                for (loc in locals) {
-                    if (loc.syncId.isNotBlank() && !serverSyncIds.contains(loc.syncId) && !pendingSyncIds.contains(loc.syncId)
-                            && loc.updatedAt <= maxRemoteUpdatedAt) {
-                        database.prescriptionDao().deletePrescription(loc)
-                    }
-                }
-            }
-            Supabase.TABLE_BANK_ACCOUNTS -> {
-                val locals = database.bankAccountDao().getAllList()
-                for (loc in locals) {
-                    if (loc.syncId.isNotBlank() && !serverSyncIds.contains(loc.syncId) && !pendingSyncIds.contains(loc.syncId)
-                            && loc.updatedAt <= maxRemoteUpdatedAt) {
-                        database.bankAccountDao().deleteBankAccount(loc)
-                    }
-                }
-            }
-            Supabase.TABLE_PERSONAL_SUB_ACCOUNTS -> {
-                val locals = database.personalSubAccountDao().getAllList()
-                for (loc in locals) {
-                    if (loc.syncId.isNotBlank() && !serverSyncIds.contains(loc.syncId) && !pendingSyncIds.contains(loc.syncId)
-                            && loc.updatedAt <= maxRemoteUpdatedAt) {
-                        database.personalSubAccountDao().deleteSubAccount(loc)
-                    }
-                }
-            }
-            Supabase.TABLE_CHILDREN_EXPENSES -> {
-                val locals = database.childrenExpenseDao().getAllList()
-                for (loc in locals) {
-                    if (loc.syncId.isNotBlank() && !serverSyncIds.contains(loc.syncId) && !pendingSyncIds.contains(loc.syncId)
-                            && loc.updatedAt <= maxRemoteUpdatedAt) {
-                        database.childrenExpenseDao().deleteChildrenExpense(loc)
-                    }
-                }
-            }
-            Supabase.TABLE_UNREGISTERED_BANK_SMS -> {
-                val locals = database.unregisteredBankSmsDao().getAllList()
-                for (loc in locals) {
-                    if (loc.syncId.isNotBlank() && !serverSyncIds.contains(loc.syncId) && !pendingSyncIds.contains(loc.syncId)
-                            && loc.updatedAt <= maxRemoteUpdatedAt) {
-                        database.unregisteredBankSmsDao().deleteById(loc.id)
-                    }
-                }
-            }
-            Supabase.TABLE_LAB_SERVICES -> {
-                val locals = database.labServiceDao().getAllList()
-                for (loc in locals) {
-                    if (loc.syncId.isNotBlank() && !serverSyncIds.contains(loc.syncId) && !pendingSyncIds.contains(loc.syncId)
-                            && loc.updatedAt <= maxRemoteUpdatedAt) {
-                        database.labServiceDao().deleteLabService(loc)
-                    }
-                }
-            }
-            Supabase.TABLE_FIXED_INCOMES -> {
-                val locals = database.fixedIncomeDao().getAllList()
-                for (loc in locals) {
-                    if (loc.syncId.isNotBlank() && !serverSyncIds.contains(loc.syncId) && !pendingSyncIds.contains(loc.syncId)
-                            && loc.updatedAt <= maxRemoteUpdatedAt) {
-                        database.fixedIncomeDao().deleteFixedIncome(loc)
-                    }
-                }
-            }
-            Supabase.TABLE_TREATMENT_STAGES -> {
-                val locals = database.treatmentStageDao().getAllList()
-                for (loc in locals) {
-                    if (loc.syncId.isNotBlank() && !serverSyncIds.contains(loc.syncId) && !pendingSyncIds.contains(loc.syncId)
-                            && loc.updatedAt <= maxRemoteUpdatedAt) {
-                        database.treatmentStageDao().deleteStage(loc)
-                    }
-                }
-            }
-            Supabase.TABLE_PATIENT_DOCUMENTS -> {
-                val locals = database.patientDocumentDao().getAllList()
-                for (loc in locals) {
-                    if (loc.syncId.isNotBlank() && !serverSyncIds.contains(loc.syncId) && !pendingSyncIds.contains(loc.syncId)
-                            && loc.updatedAt <= maxRemoteUpdatedAt) {
-                        database.patientDocumentDao().deleteDocument(loc)
-                    }
-                }
-            }
-            Supabase.TABLE_VENDOR_INVOICES -> {
-                val locals = database.vendorInvoiceDao().getAllList()
-                for (loc in locals) {
-                    if (loc.syncId.isNotBlank() && !serverSyncIds.contains(loc.syncId) && !pendingSyncIds.contains(loc.syncId)
-                            && loc.updatedAt <= maxRemoteUpdatedAt) {
-                        database.vendorInvoiceDao().deleteInvoice(loc)
-                    }
-                }
-            }
-            Supabase.TABLE_INSTALLMENTS -> {
-                val locals = database.installmentDao().getAllList()
-                for (loc in locals) {
-                    if (loc.syncId.isNotBlank() && !serverSyncIds.contains(loc.syncId) && !pendingSyncIds.contains(loc.syncId)
-                            && loc.updatedAt <= maxRemoteUpdatedAt) {
-                        database.installmentDao().deleteInstallment(loc)
-                    }
-                }
-            }
-            Supabase.TABLE_APP_CALENDAR_EVENTS -> {
-                val locals = database.appCalendarEventDao().getAllList()
-                for (loc in locals) {
-                    if (loc.syncId.isNotBlank() && !serverSyncIds.contains(loc.syncId) && !pendingSyncIds.contains(loc.syncId)
-                            && loc.updatedAt <= maxRemoteUpdatedAt) {
-                        database.appCalendarEventDao().deleteCalendarEvent(loc)
-                    }
-                }
-            }
-            Supabase.TABLE_FINANCIAL_LEDGER -> {
-                val locals = database.financialLedgerDao().getAllList()
-                for (loc in locals) {
-                    if (loc.syncId.isNotBlank() && !serverSyncIds.contains(loc.syncId) && !pendingSyncIds.contains(loc.syncId)
-                            && loc.updatedAt <= maxRemoteUpdatedAt) {
-                        database.financialLedgerDao().deleteBySyncId(loc.syncId)
-                    }
-                }
-            }
-            Supabase.TABLE_DRUG_TEMPLATES -> {
-                val locals = database.drugTemplateDao().getAllList()
-                for (loc in locals) {
-                    if (loc.syncId.isNotBlank() && !serverSyncIds.contains(loc.syncId) && !pendingSyncIds.contains(loc.syncId)
-                            && loc.updatedAt <= maxRemoteUpdatedAt) {
-                        database.drugTemplateDao().delete(loc)
-                    }
-                }
-            }
-            Supabase.TABLE_AUDIT_EVENTS -> {
-                val locals = database.auditEventDao().getAllList()
-                for (loc in locals) {
-                    if (loc.syncId.isNotBlank() && !serverSyncIds.contains(loc.syncId) && !pendingSyncIds.contains(loc.syncId)
-                            && loc.updatedAt <= maxRemoteUpdatedAt) {
-                        // AuditEventDao has no delete; keep leftover local rows rather than risk data loss.
-                    }
-                }
-            }
-        }
-    }
-
-    suspend fun uploadFile(
+        suspend fun uploadFile(
         localFile: File,
         bucketId: String = Supabase.BUCKET_PATIENT_MEDIA,
         category: com.example.util.StorageCategory = com.example.util.StorageCategory.MISC
@@ -1400,7 +1160,7 @@ class SyncEngine(
             // مسیر برگشتی ({uid}/{category}/{sha256}.ext) همان fileId ذخیره‌شده در
             // رکوردهاست. RLS روی Storage اجازه‌ی نوشتن فقط در پوشه‌ی خودِ کاربر را
             // می‌دهد. نامِ محتوامحور یعنی آپلود دوبارهٔ همان فایل شیء تکراری نمی‌سازد.
-            val objectId = Supabase.uploadToBucket(localFile, bucketId, category) ?: return@withContext null
+            val objectId = transport.upload(localFile, bucketId, category) ?: return@withContext null
             try {
                 val dir = File(context.filesDir, "images")
                 if (!dir.exists()) dir.mkdirs()
@@ -1421,6 +1181,12 @@ class SyncEngine(
     }
 
     companion object {
+        private val syncMutex = Mutex()
+        internal fun isValidCachedFile(file: File, objectPath: String): Boolean {
+            if (!file.isFile || file.length() <= 0) return false
+            val expected = objectPath.substringAfterLast('/').substringBeforeLast('.')
+            return !Regex("[a-fA-F0-9]{64}").matches(expected) || com.example.util.StorageCategory.contentHash(file).equals(expected, true)
+        }
         suspend fun downloadFile(context: android.content.Context, fileId: String, bucketId: String = Supabase.BUCKET_PATIENT_MEDIA): java.io.File? = withContext(Dispatchers.IO) {
             try {
                 if (fileId.isBlank()) return@withContext null
@@ -1433,7 +1199,8 @@ class SyncEngine(
                 val dir = java.io.File(context.filesDir, "images")
                 if (!dir.exists()) dir.mkdirs()
                 val dest = java.io.File(dir, Supabase.cacheFileNameFor(fileId))
-                if (dest.exists() && dest.length() > 0) return@withContext dest
+                if (isValidCachedFile(dest, fileId)) return@withContext dest
+                if (dest.exists()) dest.delete()
 
                 // 3. Attempt download across buckets
                 val buckets = listOf(bucketId, Supabase.BUCKET_PATIENT_MEDIA, Supabase.BUCKET_CLINIC_ASSETS).distinct()
@@ -1441,7 +1208,12 @@ class SyncEngine(
                     try {
                         val bytes = Supabase.downloadFromBucket(b, fileId)
                         if (bytes != null && bytes.isNotEmpty()) {
-                            dest.writeBytes(bytes)
+                            val temp = File.createTempFile("media-", ".part", dir)
+                            try {
+                                temp.writeBytes(bytes)
+                                check(isValidCachedFile(temp, fileId)) { "Downloaded image checksum mismatch" }
+                                check(temp.renameTo(dest)) { "Could not commit downloaded image" }
+                            } finally { temp.delete() }
                             return@withContext dest
                         }
                     } catch (e: Exception) {
@@ -1467,7 +1239,7 @@ class SyncEngine(
     suspend fun deleteAccountAndAllServerData(onProgress: (String) -> Unit = {}): Boolean = withContext(Dispatchers.IO) {
         onProgress("در حال حذف همه‌ی داده‌ها و فایل‌ها از سرور...")
         try {
-            Supabase.rpc("delete_my_account")
+            Supabase.invokeEdgeFunction("delete-account", null)
             true
         } catch (e: Exception) {
             Log.e("SyncEngine", "خطا در حذف حساب از سرور: ${e.message}", e)
@@ -1476,27 +1248,7 @@ class SyncEngine(
     }
 
     private suspend fun deleteRemoteDocument(collectionId: String, documentId: String) {
-        try {
-            // قبل از حذف ردیف، فایل‌های وابسته در Storage را پاک کن
-            try {
-                val row = Supabase.fetchRow(collectionId, documentId)
-                if (row != null) {
-                    val fileFields = listOf("photoFileId", "fileId", "chequePhotoFileId", "invoicePhotoFileId", "documentFileId", "logoFileId", "photo_file_id", "cheque_photo_file_id", "invoice_photo_file_id", "document_file_id", "logo_file_id")
-                    for (field in fileFields) {
-                        val fileId = row.get(field)?.takeIf { it.isJsonPrimitive && !it.isJsonNull }?.asString
-                        if (!fileId.isNullOrBlank()) {
-                            val bucketId = if (field.contains("logo") || field.contains("invoicePhoto") || field.contains("invoice_photo") || field.contains("documentFile") || field.contains("document_file")) Supabase.BUCKET_CLINIC_ASSETS else Supabase.BUCKET_PATIENT_MEDIA
-                            Supabase.deleteStorageObject(bucketId, fileId)
-                        }
-                    }
-                }
-            } catch (e: Exception) {
-                // رکورد ممکن است از قبل حذف شده باشد
-            }
-            Supabase.deleteRow(collectionId, documentId)
-        } catch (e: Exception) {
-            android.util.Log.e("SyncEngine", "Failed to delete remote row $documentId from $collectionId: ${e.message}")
-        }
+        if (collectionId != Supabase.TABLE_FINANCIAL_LEDGER) transport.delete(collectionId, documentId)
     }
 
     private fun parseSyncError(e: Exception, table: String): String {
@@ -1852,11 +1604,80 @@ class SyncEngine(
         }
     }
 
+    private suspend fun requireMatchingAccount(): String {
+        val owner = transport.ensureAccountId()
+        val expected = context.getSharedPreferences("dental_pro_prefs", Context.MODE_PRIVATE).getString("auth_account_id", "").orEmpty()
+        if (expected.isNotBlank() && expected != owner) throw AccountMismatchException()
+        return owner
+    }
+
+    private suspend fun applyRemoteDeletions() {
+        var offset = 0
+        val knownTables = setOf("patients", "treatments", "payments", "appointments", "treatment_stages", "patient_documents", "vendors", "vendor_invoices", "lab_orders", "equipment_maintenance", "clinic_expenses", "expense_payments", "party_accounts", "personal_transactions", "lab_services", "installments", "treatment_templates", "prescriptions", "bank_accounts", "personal_sub_accounts", "fixed_incomes", "children_expenses", "clinic_settings", "app_calendar_events", "financial_ledger", "audit_events", "drug_templates", "staff_members", "unregistered_bank_sms")
+        while (true) {
+            val rows = Supabase.fetchPage("sync_tombstones", offset, 1000)
+            for (entry in rows) {
+                val row = entry.asJsonObject
+                val table = row.get("collection_table").asString
+                val key = row.get("record_sync_id").asString
+                if (table !in knownTables) continue
+                database.withTransaction {
+                    if (!database.pendingSyncOpDao().hasPending(table, key)) {
+                        database.openHelper.writableDatabase.execSQL("DELETE FROM `$table` WHERE syncId = ?", arrayOf(key))
+                    }
+                }
+            }
+            if (rows.size() < 1000) break
+            offset += 1000
+        }
+    }
+
+    private fun persistUploadedMedia(table: String, before: Any, after: Any) {
+        val gson = com.google.gson.Gson()
+        val old = gson.toJsonTree(before).asJsonObject
+        val next = gson.toJsonTree(after).asJsonObject
+        val fields = setOf("photoFileId", "photoLocalPath", "fileId", "localCachePath", "chequePhotoFileId", "documentFileId", "invoicePhotoFileId", "logoFileId", "avatarFileId", "signatureFileId")
+        val changed = fields.filter { old.get(it) != next.get(it) && next.get(it)?.isJsonPrimitive == true }
+        if (changed.isEmpty()) return
+        val references = changed.filter { it.endsWith("FileId") || it == "fileId" }
+        fun column(field: String): String = when ("$table:$field") {
+            "payments:chequePhotoFileId" -> "chequePhotoBase64"
+            "vendors:invoicePhotoFileId", "clinic_expenses:invoicePhotoFileId" -> "invoicePhotoBase64"
+            "vendor_invoices:documentFileId" -> "photoBase64"
+            else -> field
+        }
+        val where = references.joinToString(" AND ") { if (old.get(it)?.isJsonNull != false) "`${column(it)}` IS NULL" else "`${column(it)}` = ?" }
+        val args = changed.map { next.get(it).asString } + old.get("syncId").asString + references.mapNotNull { old.get(it)?.takeIf { el -> !el.isJsonNull }?.asString }
+        val sql = "UPDATE `$table` SET " + changed.joinToString { "`${column(it)}` = ?" } + " WHERE syncId = ?" + if (where.isBlank()) "" else " AND $where"
+        database.openHelper.writableDatabase.execSQL(sql, args.toTypedArray())
+    }
+
     private suspend fun upsertRemoteDocument(collectionId: String, documentId: String, data: Map<String, Any>) {
         // Supabase.upsertRow: تبدیل camelCase→snake_case، ستِ اجباری owner_id
         // (الزام RLS)، upsert با on_conflict=sync_id و هرسِ خودکار ستون ناشناخته
         // (PGRST204) با تلاش مجدد.
-        Supabase.upsertRow(collectionId, documentId, data)
+        val payload = data.toMutableMap()
+        if (collectionId == Supabase.TABLE_PATIENT_DOCUMENTS) {
+            check(!(payload["fileId"] as? String).isNullOrBlank()) { "Document image upload is incomplete; kept in sync queue" }
+        }
+        val mediaFields = setOf("photoFileId", "fileId", "chequePhotoFileId", "documentFileId", "invoicePhotoFileId", "logoFileId", "avatarFileId", "signatureFileId")
+        for (field in mediaFields) {
+            val value = payload[field] as? String ?: continue
+            if (value.startsWith("/") || value.startsWith("content:") || value.startsWith("file:")) {
+                val file = File(value)
+                check(file.isFile && file.length() > 0L) { "Local image is missing for $collectionId/$field" }
+                val clinic = collectionId in setOf("clinic_settings", "staff_members", "vendor_invoices", "vendors", "clinic_expenses")
+                val category = when {
+                    field.contains("cheque", true) -> com.example.util.StorageCategory.CHEQUES
+                    clinic -> com.example.util.StorageCategory.CLINIC
+                    else -> com.example.util.StorageCategory.PATIENTS
+                }
+                val bucket = if (clinic) Supabase.BUCKET_CLINIC_ASSETS else Supabase.BUCKET_PATIENT_MEDIA
+                payload[field] = checkNotNull(uploadFile(file, bucket, category)) { "Image upload incomplete; kept in sync queue" }
+            }
+        }
+        persistUploadedMedia(collectionId, data, payload)
+        transport.upsert(collectionId, documentId, payload)
     }
 }
 

@@ -33,11 +33,15 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
     override suspend fun doWork(): Result {
         return try {
             val db = AppDatabase.getDatabase(applicationContext)
-            val repository = DentalRepository(db)
+            val repository = DentalRepository(db) {
+                applicationContext.getSharedPreferences("dental_pro_prefs", Context.MODE_PRIVATE).getString("auth_account_id", null)
+            }
             // اگر چیزی برای ارسال نیست، بی‌جهت شبکه باز نمی‌کنیم.
-            val engine = SyncEngine(isGuestMode = false, context = applicationContext, repository = repository, database = db)
+            val engine = SyncEngine(isGuestMode = false, context = applicationContext, repository = repository, database = db, observeNetwork = false)
             engine.pushPending()
-            Result.success()
+            if (db.pendingSyncOpDao().countOnce() > 0) return Result.retry()
+            engine.pullAll()
+            if (engine.failedCollections.value.isEmpty() && engine.lastError.value.isNullOrBlank()) Result.success() else Result.retry()
         } catch (e: Exception) {
             Result.retry()
         }

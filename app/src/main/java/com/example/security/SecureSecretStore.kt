@@ -6,12 +6,10 @@ import android.security.keystore.KeyProperties
 import android.util.Base64
 import android.util.Log
 import java.security.KeyStore
-import java.security.SecureRandom
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
-import javax.crypto.spec.SecretKeySpec
 
 /** Small Android-Keystore-backed store for credentials that must not be plaintext preferences. */
 object SecureSecretStore {
@@ -21,13 +19,11 @@ object SecureSecretStore {
     private const val PREFIX = "enc_v1_"
     private const val IV_BYTES = 12
 
-    private var fallbackKey: SecretKey? = null
 
     @Synchronized
     fun put(context: Context, name: String, value: String) {
         if (!name.matches(Regex("[a-z0-9_]{1,64}"))) {
-            Log.w(TAG, "Invalid secret name: $name")
-            return
+            throw IllegalArgumentException("Invalid secret name")
         }
         if (value.isEmpty()) {
             remove(context, name)
@@ -49,9 +45,9 @@ object SecureSecretStore {
             context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                 .edit()
                 .putString(PREFIX + name, Base64.encodeToString(envelope, Base64.NO_WRAP))
-                .apply()
+                .commit().also { check(it) { "Secure storage write failed" } }
         } catch (e: Throwable) {
-            Log.e(TAG, "Failed to persist secret $name securely", e)
+            throw IllegalStateException("Cannot persist secure secret $name", e)
         }
     }
 
@@ -63,7 +59,7 @@ object SecureSecretStore {
         return try {
             val envelope = Base64.decode(encoded, Base64.NO_WRAP)
             val ivLength = envelope.firstOrNull()?.toInt()?.and(0xff) ?: return null
-            if (envelope.size <= 1 + ivLength) return null
+            require(ivLength == IV_BYTES && envelope.size >= 1 + ivLength + 16) { "Invalid secret envelope" }
             val iv = envelope.copyOfRange(1, 1 + ivLength)
             val ciphertext = envelope.copyOfRange(1 + ivLength, envelope.size)
             val key = getOrCreateKey()
@@ -73,9 +69,7 @@ object SecureSecretStore {
             }
             String(cipher.doFinal(ciphertext), Charsets.UTF_8)
         } catch (error: Exception) {
-            Log.w(TAG, "Secure secret '$name' cannot be decrypted, returning null", error)
-            remove(context, name)
-            null
+            throw IllegalStateException("Secure secret $name cannot be decrypted; recovery is required", error)
         }
     }
 
@@ -90,17 +84,14 @@ object SecureSecretStore {
         }
     }
 
-    /** Wipes every secret in the secure store (cloud API token, backup secrets, DB passphrase, etc). Call on logout. */
+    /** Session cleanup must retain the key used by the still-existing Room database. */
     @Synchronized
     fun clearAll(context: Context) {
-        try {
-            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                .edit()
-                .clear()
-                .apply()
-        } catch (e: Throwable) {
-            Log.e(TAG, "Failed to clear secure secrets", e)
-        }
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val dbKey = prefs.getString(PREFIX + "database_passphrase_v1", null)
+        val editor = prefs.edit().clear()
+        if (dbKey != null) editor.putString(PREFIX + "database_passphrase_v1", dbKey)
+        check(editor.commit()) { "Secure storage cleanup failed" }
     }
 
     private fun getOrCreateKey(): SecretKey {
@@ -119,14 +110,8 @@ object SecureSecretStore {
                     .build()
             )
             keyGen.generateKey()
-        } catch (e: Throwable) {
-            Log.w(TAG, "AndroidKeyStore unavailable, falling back to software key", e)
-            fallbackKey ?: synchronized(this) {
-                fallbackKey ?: run {
-                    val keyBytes = ByteArray(32).apply { SecureRandom().nextBytes(this) }
-                    SecretKeySpec(keyBytes, "AES").also { fallbackKey = it }
-                }
-            }
+        } catch (e: Exception) {
+            throw IllegalStateException("Android Keystore is unavailable; secure recovery is required", e)
         }
     }
 }

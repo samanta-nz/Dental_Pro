@@ -20,14 +20,11 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.util.AppUpdateManager
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.io.File
 
-/**
- * دیالوگ بروزرسانی درون‌برنامه‌ای — نسخه 7.0.0 (نوع ۱ اجباری):
- * - پشتیبانی مستقیم از لینک گوگل‌درایو (بدون باز کردن مرورگر)
- * - نمایش حجم کل / حجم دانلود شده / درصد / سرعت دانلود
- * - پس از اتمام: بستن اپ و باز کردن نصب‌کننده
- */
+/** Download a verified update and hand it to Android's user-confirmed installer. */
 @Composable
 fun AppUpdateDialog(
     info: AppUpdateManager.AppUpdateInfo,
@@ -51,16 +48,6 @@ fun AppUpdateDialog(
     }
 
     fun startDownloadAndInstall() {
-        val existing = downloadedFile
-        if (existing != null && existing.isFile && existing.length() > 500_000L) {
-            if (!AppUpdateManager.canInstallPackages(context)) {
-                needsInstallPermission = true
-                AppUpdateManager.openInstallPermissionSettings(context)
-                return
-            }
-            AppUpdateManager.installApk(context, existing)
-            return
-        }
         downloading = true
         errorMessage = null
         progress = 0f
@@ -70,10 +57,12 @@ fun AppUpdateDialog(
         scope.launch {
             try {
                 val file = AppUpdateManager.downloadApk(context, info) { prog: AppUpdateManager.DownloadProgress ->
-                    progress = prog.percent
-                    totalBytes = prog.totalBytes
-                    downloadedBytes = prog.downloadedBytes
-                    speedBps = prog.speedBytesPerSecond
+                    scope.launch(Dispatchers.Main) {
+                        progress = prog.percent
+                        totalBytes = prog.totalBytes
+                        downloadedBytes = prog.downloadedBytes
+                        speedBps = prog.speedBytesPerSecond
+                    }
                 }
                 downloadedFile = file
                 downloading = false
@@ -173,8 +162,8 @@ fun AppUpdateDialog(
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Text(
-                            text = if (isPersian) "⚠️ این بروزرسانی اجباری نوع ۱ است و برای ادامه استفاده باید نصب شود. دکمه «بعداً» وجود ندارد."
-                                   else "⚠️ This is a mandatory Type 1 update. You must install to continue.",
+                            text = if (isPersian) "⚠️ برای ادامه استفاده، این نسخه را نصب کنید."
+                                   else "⚠️ Install this update to continue.",
                             color = MaterialTheme.colorScheme.error,
                             fontSize = 11.sp,
                             fontWeight = FontWeight.Bold,

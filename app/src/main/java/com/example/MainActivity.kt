@@ -37,7 +37,9 @@ class MainActivity : FragmentActivity() {
   /** برداشت کد OAuth (dental://app?code=...) از Deep Link. */
   private fun handleDeepLink(intent: android.content.Intent?) {
     try {
-      val code = intent?.data?.getQueryParameter("code")
+      val uri = intent?.data ?: return
+      if (uri.scheme != "dental" || uri.host != "app") return
+      val code = uri.getQueryParameter("code")
       if (!code.isNullOrBlank()) viewModel.handleOAuthCallback(code)
     } catch (e: Exception) {
       // deep link بی‌اهمیت — نادیده گرفته می‌شود
@@ -47,6 +49,7 @@ class MainActivity : FragmentActivity() {
   override fun onNewIntent(intent: android.content.Intent) {
     super.onNewIntent(intent)
     handleDeepLink(intent)
+    if (intent.getBooleanExtra("EXTRA_OPEN_APP_UPDATE", false)) viewModel.checkForAppUpdate(notify = false)
   }
 
   override fun onStop() {
@@ -74,6 +77,7 @@ class MainActivity : FragmentActivity() {
       // یادآورها + سینکِ دوره‌ای روی WorkManager (idempotent با KEEP) + آپدیت ویجت.
       com.example.reminders.ReminderCheckWorker.schedule(applicationContext)
       com.example.sync.SyncWorker.schedule(applicationContext)
+      com.example.util.AppUpdateWorker.schedule(applicationContext)
       com.example.widget.AppointmentsWidgetProvider.requestUpdate(applicationContext)
     }
 

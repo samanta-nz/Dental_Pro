@@ -1856,7 +1856,7 @@ fun ClinicalDocumentsTab(
                                             // Handle legacy string deletion
                                             val currentUris = patient.documentUris.split(",").toMutableList()
                                             if (currentUris.isNotEmpty()) {
-                                                currentUris.removeLast()
+                                                currentUris.removeAt(currentUris.lastIndex)
                                                 viewModel.updatePatient(patient.copy(documentUris = currentUris.joinToString(",")))
                                             }
                                         }
@@ -6670,7 +6670,8 @@ fun CashFundEditorDialog(
                                 bankName = trimmed,
                                 cardHolder = holderName,
                                 balance = bal
-                            )
+                            ),
+                            updateBalance = bal != existing.balance
                         )
                     }
                     onDismiss()
@@ -7209,7 +7210,8 @@ fun EditBankAccountDialog(
                                 expireMonth = expireMonth,
                                 expireYear = expireYear,
                                 iban = iban
-                            )
+                            ),
+                            updateBalance = bal != account.balance
                         )
                         onDismiss()
                     }

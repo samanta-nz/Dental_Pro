@@ -1,3 +1,7 @@
+-- Historical LOCAL SQLite migration notes, moved out of the Supabase SQL directory.
+-- Current truth: app/schemas/com.example.data.AppDatabase/17.json and AppDatabase.ALL_MIGRATIONS.
+-- Do not execute this SQLite reference on PostgreSQL.
+
 -- ============================================================================
 --  DentalPro — SQLite / Room schema migrations (consolidated)
 -- ----------------------------------------------------------------------------

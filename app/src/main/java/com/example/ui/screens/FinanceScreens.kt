@@ -698,7 +698,7 @@ private fun PartyLedgerDialog(
     val partyInvoices = allExpensesRaw.filter { !it.isDeleted && it.belongsToParty(party) }.sortedBy { it.date }
     val partyInvoiceIds = partyInvoices.map { it.id }.toSet()
     val partyPayments = expensePayments
-        .filter { !it.isDeleted && ((it.partyAccountId != null && it.partyAccountId == party.id) || it.clinicExpenseId in partyInvoiceIds) }
+        .filter { !it.isDeleted && it.countsAsPartyPayment() && ((it.partyAccountId != null && it.partyAccountId == party.id) || it.clinicExpenseId in partyInvoiceIds) }
         .sortedBy { it.date }
     val ledger = PartyLedger(partyInvoices.sumOf { it.amount }, partyPayments.sumOf { it.amount })
 

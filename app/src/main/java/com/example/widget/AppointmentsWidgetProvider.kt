@@ -59,7 +59,7 @@ class AppointmentsWidgetProvider : AppWidgetProvider() {
                 lineIds.forEachIndexed { index, viewId ->
                     val appt = todays.getOrNull(index)
                     if (appt != null) {
-                        views.setTextViewText(viewId, "${timeFmt.format(java.util.Date(appt.date))} — ${appt.patientName}")
+                        views.setTextViewText(viewId, "${timeFmt.format(java.util.Date(appt.date))} — نوبت مطب")
                         views.setViewVisibility(viewId, android.view.View.VISIBLE)
                     } else {
                         views.setViewVisibility(viewId, android.view.View.GONE)

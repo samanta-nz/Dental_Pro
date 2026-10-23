@@ -146,16 +146,19 @@ object Supabase {
     fun init(context: Context) {
         appContext = context.applicationContext
         val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val access = prefs.getString(KEY_ACCESS, null)
-        val refresh = prefs.getString(KEY_REFRESH, null)
-        val expires = prefs.getLong(KEY_EXPIRES, 0L)
-        val uid = prefs.getString(KEY_USER_ID, null)
-        val email = prefs.getString(KEY_EMAIL, null)
-        if (!access.isNullOrBlank() && !refresh.isNullOrBlank()) {
-            currentSession = Session(access, refresh, expires, uid, email)
-            currentAccountId = uid
+        val secure = com.example.security.SecureSecretStore.get(appContext, "supabase_session")
+        currentSession = secure?.let { gson.fromJson(it, Session::class.java) }
+        if (currentSession == null) {
+            val access = prefs.getString(KEY_ACCESS, null)
+            val refresh = prefs.getString(KEY_REFRESH, null)
+            if (!access.isNullOrBlank() && !refresh.isNullOrBlank()) {
+                saveSession(Session(access, refresh, prefs.getLong(KEY_EXPIRES, 0L), prefs.getString(KEY_USER_ID, null), prefs.getString(KEY_EMAIL, null)))
+            }
         }
-        pendingPkceVerifier = prefs.getString(KEY_OAUTH_VERIFIER, null)
+        currentAccountId = currentSession?.userId
+        pendingPkceVerifier = com.example.security.SecureSecretStore.get(appContext, "pkce_verifier")
+            ?: prefs.getString(KEY_OAUTH_VERIFIER, null)?.also { savePkceVerifier(it) }
+        prefs.edit().clear().commit()
     }
 
     // ------------------------------------------------------------------
@@ -165,12 +168,12 @@ object Supabase {
     private val snakeRegex = Regex("_([a-z])")
 
     fun toSnakeCase(key: String): String =
-        camelRegex.replace(key) { m ->
+        if (key == "sentWhatsApp") "sent_whatsapp" else camelRegex.replace(key) { m ->
             "${m.groupValues[1]}_${m.groupValues[2].lowercase()}"
         }
 
     fun toCamelCase(key: String): String =
-        snakeRegex.replace(key) { it.groupValues[1].uppercase() }
+        if (key == "sent_whatsapp") "sentWhatsApp" else snakeRegex.replace(key) { it.groupValues[1].uppercase() }
 
     /** کلیدهای یک JsonObject را به snake_case تبدیل می‌کند (برای ارسال به PostgREST). */
     fun jsonKeysToSnake(obj: JsonObject): JsonObject {
@@ -234,27 +237,17 @@ object Supabase {
     }
 
     private fun saveSession(session: Session?) {
+        if (session == null) com.example.security.SecureSecretStore.remove(appContext, "supabase_session")
+        else com.example.security.SecureSecretStore.put(appContext, "supabase_session", gson.toJson(session))
         currentSession = session
         currentAccountId = session?.userId
-        val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val ed = prefs.edit()
-        if (session == null) {
-            ed.remove(KEY_ACCESS).remove(KEY_REFRESH).remove(KEY_EXPIRES)
-                .remove(KEY_USER_ID).remove(KEY_EMAIL)
-        } else {
-            ed.putString(KEY_ACCESS, session.accessToken)
-                .putString(KEY_REFRESH, session.refreshToken)
-                .putLong(KEY_EXPIRES, session.expiresAt)
-                .putString(KEY_USER_ID, session.userId)
-                .putString(KEY_EMAIL, session.email)
-        }
-        ed.apply()
+        appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit().clear().commit()
     }
 
     fun savePkceVerifier(verifier: String?) {
+        if (verifier == null) com.example.security.SecureSecretStore.remove(appContext, "pkce_verifier")
+        else com.example.security.SecureSecretStore.put(appContext, "pkce_verifier", verifier)
         pendingPkceVerifier = verifier
-        appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .edit().putString(KEY_OAUTH_VERIFIER, verifier).apply()
     }
 
     fun clearPkceVerifier() = savePkceVerifier(null)
@@ -472,9 +465,8 @@ object Supabase {
      */
     suspend fun verifyMagicToken(token: String, redirectTo: String = APP_REDIRECT_URL): Session {
         val body = JsonObject().apply {
-            addProperty("token", token)
+            addProperty("token_hash", token)
             addProperty("type", "magiclink")
-            addProperty("redirect_to", redirectTo)
         }
         val text = executeBody(
             Request.Builder()
@@ -510,7 +502,7 @@ object Supabase {
         val challenge = pkceChallenge(verifier)
         return "$SUPABASE_URL/auth/v1/authorize?provider=google" +
             "&redirect_to=${URLEncoder.encode(APP_REDIRECT_URL, "UTF-8")}" +
-            "&code_challenge=$challenge&code_challenge_method=s256"
+            "&code_challenge=$challenge&code_challenge_method=s256&prompt=select_account"
     }
 
     /** تعویض کدِ بازگشتی از Deep Link (dental://app?code=...) با نشست. */
@@ -556,46 +548,22 @@ object Supabase {
         } catch (e: Exception) {
             throw SupabaseApiException(401, null, "برای سینک باید وارد حساب شوید")
         }
+        val originalOwner = camelPayload["ownerId"] as? String
+        if (!originalOwner.isNullOrBlank() && originalOwner != ownerId) throw com.example.sync.AccountMismatchException()
         val payload = camelPayload.toMutableMap()
         payload["ownerId"] = ownerId
         payload["syncId"] = recordSyncId
 
-        var attempt = 0
-        while (attempt < 10) {
-            attempt++
-            val body = JsonObject().apply {
-                for ((k, v) in payload) add(toSnakeCase(k), gson.toJsonTree(v))
-            }
-            val res = withAuth { token ->
-                execute(
-                    Request.Builder()
-                        .url("$SUPABASE_URL/rest/v1/$table?on_conflict=$conflictColumn")
-                        .headers(buildHeaders(token))
-                        .header("Prefer", "resolution=merge-duplicates,return=minimal")
-                        .post(body.toString().jsonBody())
-                        .build()
-                )
-            }
-            res.use {
-                if (it.isSuccessful) return
-                if (it.code == 400) {
-                    val errText = it.body?.string().orEmpty()
-                    // PGRST204: "Could not find the 'xxx' column ..." → ستون را حذف کن و دوباره
-                    val match = Regex("Could not find the '([a-zA-Z0-9_]+)' column").find(errText)
-                    if (match != null) {
-                        val offending = toCamelCase(match.groupValues[1])
-                        if (payload.containsKey(offending) && offending != "ownerId" && offending != "syncId") {
-                            Log.w("Supabase", "Pruning unknown column '${match.groupValues[1]}' from $table payload")
-                            payload.remove(offending)
-                            continue
-                        }
-                    }
-                    throw SupabaseApiException(400, "PGRST204", errText.take(300))
-                }
-                throw errorFrom(it)
-            }
+        val body = JsonObject().apply {
+            for ((k, v) in payload) add(toSnakeCase(k), gson.toJsonTree(v))
         }
-        throw SupabaseApiException(400, "PGRST204", "همچنان ستون ناشناخته در payload بعد از ۱۰ تلاش: $table")
+        withAuth { token ->
+            executeBody(Request.Builder()
+                .url("$SUPABASE_URL/rest/v1/$table?on_conflict=$conflictColumn")
+                .headers(buildHeaders(token))
+                .header("Prefer", "resolution=merge-duplicates,return=minimal")
+                .post(body.toString().jsonBody()).build())
+        }
     }
 
     /** یک صفحه از جدول را می‌خواند (مرتب بر اساس sync_id صعودی). */
@@ -698,11 +666,9 @@ object Supabase {
     ): String? = withContext(Dispatchers.IO) {
         try {
             if (!localFile.exists() || localFile.length() == 0L) return@withContext null
-            val uid = try {
-                ensureAccountId()
-            } catch (e: Exception) {
-                "shared"
-            }
+            val uid = ensureAccountId()
+            val expectedOwner = appContext.getSharedPreferences("dental_pro_prefs", Context.MODE_PRIVATE).getString("auth_account_id", "").orEmpty()
+            if (expectedOwner.isNotBlank() && expectedOwner != uid) throw com.example.sync.AccountMismatchException()
             val ext = localFile.extension.ifBlank {
                 if (localFile.name.endsWith(".png", true)) "png" else "jpg"
             }
@@ -739,24 +705,6 @@ object Supabase {
     suspend fun downloadFromBucket(bucketId: String, objectPath: String): ByteArray? = withContext(Dispatchers.IO) {
         if (objectPath.isBlank()) return@withContext null
         val encoded = objectPath.split("/").joinToString("/") { URLEncoder.encode(it, "UTF-8") }
-        // ۱) مسیر عمومی (باکت‌ها public هستند)
-        try {
-            val res = execute(
-                Request.Builder()
-                    .url("$SUPABASE_URL/storage/v1/object/public/$bucketId/$encoded")
-                    .headers(buildHeaders(null))
-                    .get()
-                    .build()
-            )
-            res.use {
-                if (it.isSuccessful) {
-                    val bytes = it.body?.bytes()
-                    if (bytes != null && bytes.isNotEmpty()) return@withContext bytes
-                }
-            }
-        } catch (e: Exception) {
-            // ادامه به مسیر authenticated
-        }
         // ۲) مسیر احراز‌هویت‌شده
         try {
             withAuth { token ->
@@ -803,7 +751,7 @@ object Supabase {
      * در صورت خطا، پیامِ فیلد error پاسخ را در Exception می‌گذارد.
      */
     suspend fun invokeEdgeFunction(name: String, jsonBody: JsonObject?): String {
-        val token = currentSession?.accessToken ?: ANON_KEY
+        return withAuth { token ->
         val res = execute(
             Request.Builder()
                 .url("$SUPABASE_URL/functions/v1/$name")
@@ -821,7 +769,8 @@ object Supabase {
                 }
                 throw SupabaseApiException(it.code, null, friendly ?: "خطای سرور (${it.code})")
             }
-            return text
+            text
+        }
         }
     }
 

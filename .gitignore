@@ -1,3 +1,15 @@
 
 # Local download bundles (not source)
 _deliverables/
+
+.gradle/
+.kotlin/
+**/build/
+local.properties
+keystore.properties
+*.jks
+*.keystore
+.env*
+__pycache__/
+*.pyc
+dist/

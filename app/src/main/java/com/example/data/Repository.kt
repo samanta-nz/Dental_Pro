@@ -6,7 +6,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
 
-class DentalRepository(val database: AppDatabase) {
+class DentalRepository(val database: AppDatabase, private val ownerIdProvider: () -> String? = { null }) {
 
     suspend fun <T> inTransaction(block: suspend DentalRepository.() -> T): T =
         database.withTransaction { block(this@DentalRepository) }
@@ -47,20 +47,21 @@ class DentalRepository(val database: AppDatabase) {
     val allArchivedPatients: Flow<List<Patient>> = database.patientDao().getAllArchivedPatients()
     suspend fun insertPatient(patient: Patient): Long = database.patientDao().insertPatient(patient).also { enqueueSyncOp("patients", patient.syncId, "UPSERT") }
     suspend fun deletePatient(patient: Patient) = database.patientDao().deletePatient(patient).also { enqueueSyncOp("patients", patient.syncId, "DELETE") }
-    suspend fun deletePatientCascading(patient: Patient) {
+    suspend fun deletePatientCascading(patient: Patient) = database.withTransaction {
         // نکته‌ی مهم (رفع باگ): قبلاً این تابع رکوردهای مرتبط را مستقیم از دیتابیس محلی حذف می‌کرد
         // بدون آنکه هیچ عملیات DELETE ای در صف سینک ثبت شود — یعنی حذف هرگز به سرور نمی‌رسید و
         // آن رکوردها روی سرور برای همیشه باقی می‌ماندند. حالا پیش از هر حذف دسته‌ای، رکوردهای
         // مرتبط را می‌خوانیم تا syncId شان را داشته باشیم و برای هرکدام یک DELETE در صف سینک ثبت می‌کنیم.
-        database.treatmentDao().getTreatmentsForPatientOnce(patient.id).forEach {
-            enqueueSyncOp("treatments", it.syncId, "DELETE")
-        }
-        database.treatmentDao().deleteTreatmentsForPatient(patient.id)
+        database.treatmentDao().getTreatmentsForPatientOnce(patient.id).forEach { deleteTreatment(it) }
 
         database.paymentDao().getPaymentsForPatientOnce(patient.id).forEach { p ->
             val ledger = database.financialLedgerDao().findBySource(SOURCE_PATIENT_PAYMENT, p.id)
             if (ledger != null) enqueueSyncOp("financial_ledger", ledger.syncId, "DELETE")
             enqueueSyncOp("payments", p.syncId, "DELETE")
+        }
+        database.paymentDao().getPaymentsForPatientOnce(patient.id).forEach { p ->
+            reconcilePaymentBankImpact(p, null)
+            database.financialLedgerDao().deleteBySource(SOURCE_PATIENT_PAYMENT, p.id)
         }
         database.paymentDao().deletePaymentsForPatient(patient.id)
 
@@ -140,6 +141,7 @@ class DentalRepository(val database: AppDatabase) {
     fun getTreatmentsForPatient(patientId: Long): Flow<List<Treatment>> = 
         database.treatmentDao().getTreatmentsForPatient(patientId)
     suspend fun insertTreatment(treatment: Treatment): Long {
+        require(treatment.cost >= 0L && treatment.discount in 0L..treatment.cost) { "Invalid treatment amount or discount" }
         val enriched = treatment.copy(patientSyncId = patientSyncIdOf(treatment.patientId))
         return database.treatmentDao().insertTreatment(enriched).also { enqueueSyncOp("treatments", enriched.syncId, "UPSERT") }
     }
@@ -161,13 +163,20 @@ class DentalRepository(val database: AppDatabase) {
     fun getPaymentsForPatient(patientId: Long): Flow<List<Payment>> =
         database.paymentDao().getPaymentsForPatient(patientId)
 
+    private suspend fun enrichPayment(payment: Payment): Payment = payment.copy(
+        patientSyncId = patientSyncIdOf(payment.patientId), bankAccountSyncId = bankAccountSyncIdOf(payment.bankAccountId),
+        transferExpensePaymentSyncId = payment.transferExpensePaymentId?.let { database.expensePaymentDao().getExpensePaymentById(it)?.syncId }.orEmpty(),
+        transferExpenseSyncId = payment.transferExpenseId?.let { database.clinicExpenseDao().getExpenseById(it)?.syncId }.orEmpty(),
+        transferTransactionSyncId = payment.transferTransactionId?.let { database.personalTransactionDao().getTransactionById(it)?.syncId }.orEmpty(),
+        transferChildrenExpenseSyncId = payment.transferChildrenExpenseId?.let { database.childrenExpenseDao().getChildrenExpenseById(it)?.syncId }.orEmpty(),
+        transferPartyPaymentSyncId = payment.transferPartyPaymentId?.let { database.expensePaymentDao().getExpensePaymentById(it)?.syncId }.orEmpty()
+    )
+
     suspend fun insertPayment(payment: Payment): Long = database.withTransaction {
+        require(payment.amount >= 0L) { "Payment amount must not be negative" }
         val old = payment.id.takeIf { it != 0L }?.let { database.paymentDao().getPaymentById(it) }
         reconcilePaymentBankImpact(old, payment)
-        val enriched = payment.copy(
-            patientSyncId = patientSyncIdOf(payment.patientId),
-            bankAccountSyncId = bankAccountSyncIdOf(payment.bankAccountId)
-        )
+        val enriched = enrichPayment(payment)
         val id = database.paymentDao().insertPayment(enriched)
         val withId = enriched.copy(id = id)
         upsertPaymentLedger(withId)
@@ -176,15 +185,13 @@ class DentalRepository(val database: AppDatabase) {
     }
 
     suspend fun updatePayment(payment: Payment) = database.withTransaction {
+        require(payment.amount >= 0L) { "Payment amount must not be negative" }
         require(payment.id != 0L) { "Cannot update an unsaved payment" }
         val old = requireNotNull(database.paymentDao().getPaymentById(payment.id)) {
             "Payment ${payment.id} does not exist"
         }
         reconcilePaymentBankImpact(old, payment)
-        val enriched = payment.copy(
-            patientSyncId = patientSyncIdOf(payment.patientId),
-            bankAccountSyncId = bankAccountSyncIdOf(payment.bankAccountId)
-        )
+        val enriched = enrichPayment(payment)
         database.paymentDao().updatePayment(enriched)
         upsertPaymentLedger(enriched)
         enqueueSyncOp("payments", enriched.syncId, "UPSERT")
@@ -289,6 +296,7 @@ class DentalRepository(val database: AppDatabase) {
     }
 
     suspend fun insertExpense(expense: ClinicExpense): Long {
+        require(expense.amount >= 0L) { "Expense amount must not be negative" }
         val numbered = assignInvoiceNumber(expense)
         val enriched = numbered.copy(
             labOrderSyncId = labOrderSyncIdOf(numbered.labOrderId),
@@ -299,6 +307,7 @@ class DentalRepository(val database: AppDatabase) {
         return database.clinicExpenseDao().insertExpense(enriched).also { enqueueSyncOp("clinic_expenses", enriched.syncId, "UPSERT") }
     }
     suspend fun updateExpense(expense: ClinicExpense) {
+        require(expense.amount >= 0L) { "Expense amount must not be negative" }
         val enriched = expense.copy(
             labOrderSyncId = labOrderSyncIdOf(expense.labOrderId),
             vendorSyncId = vendorSyncIdOf(expense.vendorId),
@@ -311,8 +320,8 @@ class DentalRepository(val database: AppDatabase) {
         val payments = database.expensePaymentDao().getPaymentsForExpenseOnce(expense.id)
         payments.forEach { p ->
             val ledger = database.financialLedgerDao().findBySource(SOURCE_EXPENSE_PAYMENT, p.id)
-            if (ledger?.createdAt != 0L) {
-                reconcileSignedBankImpact(p.bankAccountId, -p.amount, null, null)
+            if (ledger != null && ledger.createdAt != 0L) {
+                reconcileSignedBankImpact(p.bankAccountId, expensePaymentBankDelta(p), null, null)
             }
             database.expensePaymentDao().deleteExpensePayment(p)
             database.financialLedgerDao().deleteBySource(SOURCE_EXPENSE_PAYMENT, p.id)
@@ -328,6 +337,7 @@ class DentalRepository(val database: AppDatabase) {
     fun getPaymentsForExpense(expenseId: Long): Flow<List<ExpensePayment>> = database.expensePaymentDao().getPaymentsForExpense(expenseId)
 
     suspend fun insertExpensePayment(payment: ExpensePayment): Long = database.withTransaction {
+        require(payment.amount >= 0L) { "Expense payment must not be negative" }
         val old = payment.id.takeIf { it != 0L }?.let { database.expensePaymentDao().getExpensePaymentById(it) }
         reconcileSignedBankImpact(
             oldBankId = old?.bankAccountId,
@@ -353,15 +363,16 @@ class DentalRepository(val database: AppDatabase) {
             id = previous?.id ?: 0,
             sourceType = SOURCE_EXPENSE_PAYMENT,
             sourceId = id,
+            sourceSyncId = enriched.syncId,
             bankAccountId = payment.bankAccountId,
             bankAccountSyncId = enriched.bankAccountSyncId,
-            amountDelta = expensePaymentBankDelta(enriched),
-            status = if (payment.method == "CHEQUE" && payment.chequeStatus == "BOUNCED") "BOUNCED" else "POSTED",
+            amountDelta = enriched.postedDelta,
+            status = if (payment.method != "CHEQUE" || payment.chequeStatus in setOf("CLEARED", "TRANSFERRED")) "POSTED" else if (payment.chequeStatus == "BOUNCED") "BOUNCED" else "PENDING",
             occurredAt = payment.date,
             description = payment.note.ifBlank { "Expense payment" },
             createdAt = previous?.createdAt?.takeIf { it != 0L } ?: System.currentTimeMillis(),
             // حفظ syncId قبلی — جلوگیری از برخورد با ایندکس یکتای (source_type, source_id) در سرور.
-            syncId = previous?.syncId ?: java.util.UUID.randomUUID().toString(),
+            syncId = "ledger:$SOURCE_EXPENSE_PAYMENT:${enriched.syncId}",
         )
         database.financialLedgerDao().upsert(ledgerEntry)
         enqueueSyncOp("expense_payments", enriched.syncId, "UPSERT")
@@ -388,7 +399,7 @@ class DentalRepository(val database: AppDatabase) {
         val current = database.expensePaymentDao().getExpensePaymentById(payment.id) ?: return@withTransaction
         val ledger = database.financialLedgerDao().findBySource(SOURCE_EXPENSE_PAYMENT, current.id)
         // Version-32 records did not consistently change bank balances; only reverse entries created by this engine.
-        if (ledger?.createdAt != 0L) {
+        if (ledger != null && ledger.createdAt != 0L) {
             reconcileSignedBankImpact(current.bankAccountId, expensePaymentBankDelta(current), null, null)
         }
         database.expensePaymentDao().deleteExpensePayment(current)
@@ -616,6 +627,7 @@ class DentalRepository(val database: AppDatabase) {
     val allTransactions: Flow<List<PersonalTransaction>> = database.personalTransactionDao().getAllTransactions()
 
     suspend fun insertTransaction(tx: PersonalTransaction): Long = database.withTransaction {
+        require(tx.amount >= 0L && tx.type in setOf("INCOME", "DRAW", "EXPENSE")) { "Invalid transaction" }
         val old = tx.id.takeIf { it != 0L }?.let { database.personalTransactionDao().getTransactionById(it) }
         reconcileSignedBankImpact(
             oldBankId = old?.bankAccountId,
@@ -630,15 +642,16 @@ class DentalRepository(val database: AppDatabase) {
             id = previous?.id ?: 0,
             sourceType = SOURCE_PERSONAL_TRANSACTION,
             sourceId = id,
+            sourceSyncId = enriched.syncId,
             bankAccountId = tx.bankAccountId,
             bankAccountSyncId = enriched.bankAccountSyncId,
-            amountDelta = personalBankDelta(tx),
+            amountDelta = enriched.postedDelta,
             status = "POSTED",
             occurredAt = tx.date,
             description = tx.description,
             createdAt = previous?.createdAt?.takeIf { it != 0L } ?: System.currentTimeMillis(),
             // حفظ syncId قبلی — جلوگیری از برخورد با ایندکس یکتای (source_type, source_id) در سرور.
-            syncId = previous?.syncId ?: java.util.UUID.randomUUID().toString(),
+            syncId = "ledger:$SOURCE_PERSONAL_TRANSACTION:${enriched.syncId}",
         )
         database.financialLedgerDao().upsert(ledgerEntry)
         enqueueSyncOp("personal_transactions", enriched.syncId, "UPSERT")
@@ -682,7 +695,15 @@ class DentalRepository(val database: AppDatabase) {
 
     // Bank Accounts
     val allBankAccounts: Flow<List<BankAccount>> = database.bankAccountDao().getAllBankAccounts()
-    suspend fun insertBankAccount(account: BankAccount): Long = database.bankAccountDao().insertBankAccount(account).also { enqueueSyncOp("bank_accounts", account.syncId, "UPSERT") }
+    suspend fun insertBankAccount(account: BankAccount, updateBalance: Boolean = true): Long = database.withTransaction {
+        val current = if (account.id == 0L) null else database.bankAccountDao().getBankAccountById(account.id)
+        val movement = if (current == null) 0L else bankMovementTotal(account.id)
+        val balance = if (!updateBalance && current != null) current.balance else account.balance
+        val opening = if (!updateBalance && current != null) current.openingBalance ?: Math.subtractExact(balance, movement)
+            else Math.subtractExact(balance, movement)
+        val next = account.copy(balance = balance, openingBalance = opening, updatedAt = System.currentTimeMillis())
+        database.bankAccountDao().insertBankAccount(next).also { enqueueSyncOp("bank_accounts", next.syncId, "UPSERT") }
+    }
     suspend fun deleteBankAccount(account: BankAccount) = database.bankAccountDao().deleteBankAccount(account).also { enqueueSyncOp("bank_accounts", account.syncId, "DELETE") }
 
     // Personal Sub Accounts
@@ -828,7 +849,8 @@ class DentalRepository(val database: AppDatabase) {
         val existing = database.financialLedgerDao().findBySource(SOURCE_PATIENT_PAYMENT, payment.id)
         val posted = isPaymentPosted(payment)
         val status = when {
-            payment.chequeStatus == "BOUNCED" -> "BOUNCED"
+            payment.isDeleted -> "REVERSED"
+            payment.type == "CHEQUE" && payment.chequeStatus == "BOUNCED" -> "BOUNCED"
             posted -> "POSTED"
             else -> "PENDING"
         }
@@ -836,6 +858,7 @@ class DentalRepository(val database: AppDatabase) {
             id = existing?.id ?: 0,
             sourceType = SOURCE_PATIENT_PAYMENT,
             sourceId = payment.id,
+            sourceSyncId = payment.syncId,
             patientId = payment.patientId,
             patientSyncId = payment.patientSyncId,
             bankAccountId = payment.bankAccountId,
@@ -853,7 +876,7 @@ class DentalRepository(val database: AppDatabase) {
             // UUID تازه می‌سازد و upsert سرور (on_conflict=sync_id) به ایندکس یکتای
             // (source_type, source_id) می‌خورد، push بعد از ۵ تلاش دور انداخته می‌شود
             // و ردیفِ دفترکل در Supabase برای همیشه روی نسخهٔ اول فریز می‌ماند.
-            syncId = existing?.syncId ?: java.util.UUID.randomUUID().toString(),
+            syncId = "ledger:$SOURCE_PATIENT_PAYMENT:${payment.syncId}",
         )
         database.financialLedgerDao().upsert(ledgerEntry)
         enqueueSyncOp("financial_ledger", ledgerEntry.syncId, "UPSERT")
@@ -874,49 +897,43 @@ class DentalRepository(val database: AppDatabase) {
         newBankId: Long?,
         newDelta: Long?,
     ) {
-        if (oldBankId != null && oldDelta != null && oldDelta != 0L) {
-            check(database.bankAccountDao().adjustBalance(oldBankId, -oldDelta) == 1) {
-                "Bank account $oldBankId does not exist"
-            }
-            database.bankAccountDao().getBankAccountById(oldBankId)?.let {
-                enqueueSyncOp("bank_accounts", it.syncId, "UPSERT")
-            }
-        }
-        if (newBankId != null && newDelta != null && newDelta != 0L) {
-            check(database.bankAccountDao().adjustBalance(newBankId, newDelta) == 1) {
-                "Bank account $newBankId does not exist"
-            }
-            database.bankAccountDao().getBankAccountById(newBankId)?.let {
-                enqueueSyncOp("bank_accounts", it.syncId, "UPSERT")
-            }
+        val deltas = linkedMapOf<Long, Long>()
+        if (oldBankId != null && oldDelta != null) deltas[oldBankId] = Math.negateExact(oldDelta)
+        if (newBankId != null && newDelta != null) deltas[newBankId] = Math.addExact(deltas[newBankId] ?: 0L, newDelta)
+        for ((id, delta) in deltas) {
+            if (delta == 0L) continue
+            val account = requireNotNull(database.bankAccountDao().getBankAccountById(id)) { "Bank account $id does not exist" }
+            val baseline = account.openingBalance ?: Math.subtractExact(account.balance, bankMovementTotal(id))
+            database.bankAccountDao().insertBankAccount(account.copy(
+                balance = Math.addExact(account.balance, delta), openingBalance = baseline,
+                updatedAt = System.currentTimeMillis()
+            ))
+            enqueueSyncOp("bank_accounts", account.syncId, "UPSERT")
         }
     }
 
-    private fun paymentBankDelta(payment: Payment): Long = when {
-        payment.bankAccountId == null -> 0L
-        payment.type != "CHEQUE" -> payment.amount
-        // An endorsed cheque is settled against the patient's receivable, but it
-        // has not been deposited into the clinic's bank account.  Counting it as
-        // a bank deposit here makes the balance rise when a cheque is transferred
-        // to an expense or a personal account (those transfers do not create an
-        // offsetting bank withdrawal).
-        payment.chequeStatus == "TRANSFERRED" -> 0L
-        // وضعیت صریحِ چک تعیین‌کننده است؛ isCleared فقط برای رکوردهای قدیمی
-        // که هنوز chequeStatus نداشتند به‌عنوان fallback نگه داشته می‌شود.
-        payment.chequeStatus == "CLEARED" -> payment.amount
-        else -> 0L
-    }
-
+    private fun paymentBankDelta(payment: Payment): Long = payment.cashBankDelta
     private fun isPaymentPosted(payment: Payment): Boolean = payment.isEffectivelyPaid
+    private fun expensePaymentBankDelta(payment: ExpensePayment): Long = payment.cashBankDelta
+    private fun personalBankDelta(tx: PersonalTransaction): Long = tx.cashBankDelta
 
-    private fun expensePaymentBankDelta(payment: ExpensePayment): Long =
-        if (payment.bankAccountId != null &&
-            (payment.method != "CHEQUE" || payment.chequeStatus == "CLEARED")) -payment.amount else 0L
+    private suspend fun bankMovementTotal(id: Long): Long {
+        val deltas = database.paymentDao().getAllList().filter { it.bankAccountId == id }.map { it.cashBankDelta } +
+            database.expensePaymentDao().getAllList().filter { it.bankAccountId == id }.map { it.cashBankDelta } +
+            database.personalTransactionDao().getAllList().filter { it.bankAccountId == id }.map { it.cashBankDelta }
+        return deltas.fold(0L, Math::addExact)
+    }
 
-    private fun personalBankDelta(tx: PersonalTransaction): Long =
-        if (tx.type == "INCOME" || tx.type == "DRAW") tx.amount else -tx.amount
+    suspend fun reconcileBankBalances() = database.withTransaction {
+        for (account in database.bankAccountDao().getAllList()) {
+            val movement = bankMovementTotal(account.id)
+            val baseline = account.openingBalance ?: Math.subtractExact(account.balance, movement)
+            database.bankAccountDao().insertBankAccount(account.copy(openingBalance = baseline, balance = Math.addExact(baseline, movement)))
+        }
+    }
 
     private companion object {
+        val SYNC_TABLES = setOf("patients", "treatments", "payments", "appointments", "treatment_stages", "patient_documents", "vendors", "vendor_invoices", "lab_orders", "equipment_maintenance", "clinic_expenses", "expense_payments", "party_accounts", "personal_transactions", "lab_services", "installments", "treatment_templates", "prescriptions", "bank_accounts", "personal_sub_accounts", "fixed_incomes", "children_expenses", "clinic_settings", "app_calendar_events", "financial_ledger", "audit_events", "drug_templates", "staff_members", "unregistered_bank_sms")
         const val SOURCE_PATIENT_PAYMENT = "PATIENT_PAYMENT"
         const val SOURCE_EXPENSE_PAYMENT = "EXPENSE_PAYMENT"
         const val SOURCE_PERSONAL_TRANSACTION = "PERSONAL_TRANSACTION"
@@ -937,19 +954,22 @@ class DentalRepository(val database: AppDatabase) {
     // Pending Sync Operations Queue
     val pendingSyncOpsCount: Flow<Int> = database.pendingSyncOpDao().getCount()
 
-    suspend fun enqueueSyncOp(table: String, syncId: String, op: String = "UPSERT") {
-        if (syncId.isBlank()) return
-        try {
-            database.pendingSyncOpDao().insert(
-                PendingSyncOp(
-                    collectionTable = table,
-                    recordSyncId = syncId,
-                    operation = op
-                )
-            )
-        } catch (e: Exception) {
-            e.printStackTrace()
+    suspend fun enqueueSyncOp(table: String, syncId: String, op: String = "UPSERT") = database.withTransaction {
+        require(table in SYNC_TABLES && syncId.isNotBlank()) { "Invalid sync identity" }
+        // Server triggers derive the ledger from source records; never sync two competing projections.
+        if (table == "financial_ledger") return@withTransaction
+        if (op == "UPSERT") {
+            val owner = ownerIdProvider().orEmpty()
+            if (owner.isNotBlank()) {
+                database.openHelper.readableDatabase.query("SELECT ownerId FROM `$table` WHERE syncId = ?", arrayOf(syncId)).use { cursor ->
+                    if (cursor.moveToFirst() && cursor.getString(0).isNotBlank() && cursor.getString(0) != owner) throw com.example.sync.AccountMismatchException()
+                }
+                database.openHelper.writableDatabase.execSQL("UPDATE `$table` SET ownerId = ? WHERE syncId = ? AND ownerId = ''", arrayOf(owner, syncId))
+            }
+            database.openHelper.writableDatabase.execSQL("UPDATE `$table` SET updatedAt = ? WHERE syncId = ?", arrayOf(System.currentTimeMillis(), syncId))
         }
+        database.pendingSyncOpDao().insert(PendingSyncOp(collectionTable = table, recordSyncId = syncId, operation = op))
+        Unit
     }
 
     /**
