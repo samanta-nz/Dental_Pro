@@ -3,7 +3,7 @@
 دو workflow اضافه شده است:
 
 - `Android checks`: با push و Pull Request، آزمون‌ها و Lint اجرا می‌شوند و APK آزمایشی همراه گزارش‌ها در Artifacts قرار می‌گیرد. این خروجی برای نصب نسخهٔ نهایی نیست.
-- `Signed Android release`: با تگ `v7.0.1` یا اجرای دستی از شاخهٔ `main`، آزمون‌ها تکرار و APK با کلید خصوصی امضا می‌شود. پس از بررسی امضا، نسخه، بسته، هش و هم‌ترازی ۱۶ کیلوبایتی، APK در GitHub Releases منتشر می‌شود.
+- `Signed Android release`: با تغییر نسخه در `main`، تگ `v7.0.1` یا اجرای دستی از شاخهٔ `main`، آزمون‌ها تکرار و APK با کلید خصوصی امضا می‌شود. پس از بررسی امضا، نسخه، بسته، هش و هم‌ترازی ۱۶ کیلوبایتی، APK در GitHub Releases منتشر می‌شود.
 
 ## تنظیم یک‌بارهٔ کلید امضا
 
@@ -25,7 +25,7 @@ python3 scripts/configure-github-signing.py /private/path/dentalpro-release.jks 
 
 ## انتشار
 
-پس از قرارگرفتن تغییرات در `main` و ثبت Secrets، از **Actions → Signed Android release → Run workflow** روی شاخهٔ `main` اجرا کنید. نسخه از `gradle.properties` خوانده می‌شود و تگ متناظر هنگام انتشار ساخته می‌شود. راه دیگر، push تگ متناظر با نسخه است. اجرای دوباره روی Release موجود آن را بازنویسی نمی‌کند.
+پس از ثبت Secrets، ادغام این تغییرات در `main` ساخت و انتشار را خودکار شروع می‌کند. برای اجرای دستی نیز از **Actions → Signed Android release → Run workflow** روی شاخهٔ `main` استفاده کنید. نسخه از `gradle.properties` خوانده می‌شود و تگ متناظر هنگام انتشار ساخته می‌شود. راه دیگر، push تگ متناظر با نسخه است. اجرای دوباره روی Release موجود آن را بازنویسی نمی‌کند.
 
 برای نسخه‌های بعد، `VERSION_CODE` را افزایش دهید، `VERSION_NAME` را تنظیم کنید و گزارش همان نسخه را در `docs/RELEASE_<VERSION>_FA.md` قرار دهید.
 
