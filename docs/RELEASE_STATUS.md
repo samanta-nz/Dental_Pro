@@ -27,14 +27,18 @@ See [the Persian release report](RELEASE_7.0.1_FA.md) and [Supabase setup](SUPAB
 
 ## Final artifact
 
-Signed release build completed successfully. The delivered APK is `DentalPro-7.0.1-release.apk` (35,438,828 bytes).
+The [GitHub release](https://github.com/samanta-nz/Dental_Pro/releases/tag/v7.0.1) was published successfully from commit `6de2f685d174f92a2719435258608adcee9b85dc`. The published [APK](https://github.com/samanta-nz/Dental_Pro/releases/download/v7.0.1/DentalPro-7.0.1-release.apk) is `DentalPro-7.0.1-release.apk` (35,438,828 bytes). It was downloaded from the public release and independently verified again.
 
 - Unit tests: **87 passed, 0 failures, 0 errors, 0 skipped**.
 - Android lint: **0 errors**, 205 warnings.
 - APK signature verified and matched the new private signing key.
 - Package/version checked: `com.dentalpro.clinic`, `7.0.1` / `70001`; not debuggable.
 - ZIP alignment and all five ARM64 native libraries passed 16 KB alignment checks.
-- APK SHA-256: `4c7449ef7e4d02b408555525454d8a96838942653754ecaed8ed8c8a76708f96`.
+- APK SHA-256: `cc07b1b75ee4e6c7e8afda23a74534d32327dd67b22419b9b6796acaed83bf97`.
 - Signing certificate SHA-256: `a733266c0c7cf78db6ea99286e103385e52a76ebab3858fb91824a259988ce84`.
 
-GitHub automation is in [PR #1](https://github.com/samanta-nz/Dental_Pro/pull/1). It runs CI and publishes a signed release automatically when a version change reaches `main`. Signing secrets must be registered through repository Settings because the connected tool cannot manage Secrets. See [GitHub release instructions](GITHUB_RELEASE_FA.md). The private key and private Secrets bundle are excluded from Git.
+GitHub automation was merged through [PR #1](https://github.com/samanta-nz/Dental_Pro/pull/1). The user registered the two signing secrets; restoration, signed release verification and publication all passed in [the release run](https://github.com/samanta-nz/Dental_Pro/actions/runs/39963726410). The corresponding CI checks also passed. The private key and private Secrets bundle are excluded from Git.
+
+KSP was upgraded from 2.3.5 to 2.3.6 to fix the upstream headless AWT exception ([google/ksp#2763](https://github.com/google/ksp/issues/2763)). Debug and Release processing passed without the exception, and all 62 generated source files matched the prior output byte-for-byte.
+
+The verified GitHub APK URL, SHA-256 and byte length were registered in Supabase `app_updates` for version `70001`, active and non-mandatory. The same metadata was confirmed readable with the `anon` role. Future Supabase announcements use the publishing script or the optional publishing step described in [GitHub release instructions](GITHUB_RELEASE_FA.md).
